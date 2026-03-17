@@ -1,12 +1,13 @@
 """
 ETF NEXUS — A股场内ETF实时数据终端 Backend
-FastAPI + AKShare + APScheduler
+FastAPI + AKShare + Direct EastMoney HTTP API + APScheduler
 """
 import os, json, time, logging, math, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+import requests
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -57,75 +58,121 @@ etf_store = {"etfs": [], "indices": [], "updated": None, "source": "none"}
 
 
 # ============================================================
-# AKSHARE DATA FETCHER
+# EASTMONEY DIRECT HTTP FETCHER (primary, no AKShare dependency)
 # ============================================================
-def fetch_real_data():
-    """Fetch real data via AKShare. Returns True on success."""
-    import signal
-    def _timeout_handler(signum, frame):
-        raise TimeoutError("AKShare fetch timed out")
-    try:
-        signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(30)  # 30s total timeout for AKShare
-        import akshare as ak
-        import pandas as pd
-        logger.info("Fetching real ETF data via AKShare...")
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://quote.eastmoney.com/",
+}
 
-        # 1. Get real-time spot data for all ETFs
-        spot_df = ak.fund_etf_spot_em()
-        spot_df["代码"] = spot_df["代码"].astype(str).str.zfill(6)
-        spot_map = {}
-        for _, row in spot_df.iterrows():
-            spot_map[row["代码"]] = row
+def _em_market_code(code: str) -> str:
+    """Return market prefix: 1 for SH, 0 for SZ."""
+    return "1" if code.startswith(("5", "6")) else "0"
+
+def _fetch_em_kline(code: str, days: int = 1200) -> list:
+    """Fetch daily kline from EastMoney HTTP API."""
+    mkt = _em_market_code(code)
+    end = datetime.now().strftime("%Y%m%d")
+    beg = (datetime.now() - timedelta(days=days)).strftime("%Y%m%d")
+    url = (
+        f"https://push2his.eastmoney.com/api/qt/stock/kline/get?"
+        f"secid={mkt}.{code}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+        f"&klt=101&fqt=1&beg={beg}&end={end}&lmt=5000"
+    )
+    resp = requests.get(url, headers=_HEADERS, timeout=15)
+    data = resp.json()
+    klines_raw = data.get("data", {}).get("klines", [])
+    result = []
+    for line in klines_raw:
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        result.append({
+            "date": parts[0],
+            "open": round(float(parts[1]), 4),
+            "close": round(float(parts[2]), 4),
+            "high": round(float(parts[3]), 4),
+            "low": round(float(parts[4]), 4),
+            "volume": int(float(parts[5])),
+        })
+    return result
+
+def _fetch_em_spot_all() -> dict:
+    """Fetch real-time spot data for all ETFs from EastMoney."""
+    url = (
+        "https://push2.eastmoney.com/api/qt/clist/get?"
+        "pn=1&pz=500&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:MK0021,b:MK0022,b:MK0023,b:MK0024"
+        "&fields=f2,f3,f12,f14,f20"
+    )
+    resp = requests.get(url, headers=_HEADERS, timeout=15)
+    data = resp.json()
+    items = data.get("data", {}).get("diff", [])
+    spot_map = {}
+    for item in items:
+        code = str(item.get("f12", ""))
+        spot_map[code] = {
+            "price": item.get("f2"),       # 最新价
+            "chg_pct": item.get("f3"),     # 涨跌幅
+            "total_mv": item.get("f20"),   # 总市值
+            "name": item.get("f14", ""),
+        }
+    return spot_map
+
+def _fetch_em_indices() -> list:
+    """Fetch major index data."""
+    indices = []
+    index_codes = [("1.000001", "上证指数"), ("0.399001", "深证成指"), ("0.399006", "创业板指")]
+    for secid, name in index_codes:
+        try:
+            url = f"https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f43,f170"
+            resp = requests.get(url, headers=_HEADERS, timeout=10)
+            d = resp.json().get("data", {})
+            val = d.get("f43", 0)
+            chg = d.get("f170", 0)
+            if val:
+                indices.append({"name": name, "val": round(val / 100, 2), "chg": round(chg / 100, 2)})
+        except Exception:
+            pass
+    return indices
+
+def _max_drawdown(arr):
+    if not arr:
+        return 0
+    peak = arr[0]
+    mdd = 0
+    for v in arr:
+        if v > peak:
+            peak = v
+        dd = (v - peak) / peak
+        if dd < mdd:
+            mdd = dd
+    return round(mdd * 100, 2)
+
+def fetch_real_data():
+    """Fetch real data via direct EastMoney HTTP API. Returns True on success."""
+    try:
+        logger.info("Fetching real ETF data via EastMoney HTTP API...")
+        spot_map = _fetch_em_spot_all()
+        logger.info(f"  Spot data: {len(spot_map)} ETFs found")
 
         etfs = []
         for code, meta in TARGET_ETFS.items():
             try:
-                # Get historical K-line (3+ years)
-                end_date = datetime.now().strftime("%Y%m%d")
-                start_date = (datetime.now() - timedelta(days=1200)).strftime("%Y%m%d")
-                hist = ak.fund_etf_hist_em(
-                    symbol=code, period="daily",
-                    start_date=start_date, end_date=end_date, adjust="qfq"
-                )
-                if hist.empty:
-                    logger.warning(f"No hist data for {code}, skipping")
+                kline = _fetch_em_kline(code)
+                if len(kline) < 10:
+                    logger.warning(f"  ✗ {code} insufficient kline data ({len(kline)} days)")
                     continue
 
-                kline = []
-                for _, r in hist.iterrows():
-                    kline.append({
-                        "date": str(r["日期"])[:10],
-                        "open": round(float(r["开盘"]), 4),
-                        "close": round(float(r["收盘"]), 4),
-                        "high": round(float(r["最高"]), 4),
-                        "low": round(float(r["最低"]), 4),
-                        "volume": int(r["成交量"]),
-                    })
-
-                # Current price from spot or last kline
-                spot = spot_map.get(code)
-                current_price = float(spot["最新价"]) if spot is not None else kline[-1]["close"]
-                scale_raw = float(spot["总市值"]) if spot is not None and "总市值" in spot.index else 0
-                scale = round(scale_raw / 1e8, 2) if scale_raw > 0 else 0  # convert to 亿
-
-                # Calc stats
                 closes = [k["close"] for k in kline]
+                spot = spot_map.get(code, {})
+                current_price = spot.get("price") or closes[-1]
+                if isinstance(current_price, str):
+                    current_price = float(current_price)
+                total_mv = spot.get("total_mv", 0) or 0
+                scale = round(total_mv / 1e8, 2) if total_mv > 1000 else 0
+
                 all_high = max(closes)
                 all_low = min(closes)
-                drop_from_high = round((current_price - all_high) / all_high * 100, 2)
-                rise_from_low = round((current_price - all_low) / all_low * 100, 2)
-
-                def max_drawdown(arr):
-                    peak = arr[0]
-                    mdd = 0
-                    for v in arr:
-                        if v > peak:
-                            peak = v
-                        dd = (v - peak) / peak
-                        if dd < mdd:
-                            mdd = dd
-                    return round(mdd * 100, 2)
 
                 one_year = closes[-250:] if len(closes) > 250 else closes
                 three_year = closes[-750:] if len(closes) > 750 else closes
@@ -136,32 +183,18 @@ def fetch_real_data():
                     "scale": scale,
                     "fee": meta["fee"],
                     "currentPrice": round(current_price, 4),
-                    "dropFromHigh": drop_from_high,
-                    "riseFromLow": rise_from_low,
-                    "maxDD1Y": max_drawdown(one_year),
-                    "maxDD3Y": max_drawdown(three_year),
+                    "dropFromHigh": round((current_price - all_high) / all_high * 100, 2),
+                    "riseFromLow": round((current_price - all_low) / all_low * 100, 2),
+                    "maxDD1Y": _max_drawdown(one_year),
+                    "maxDD3Y": _max_drawdown(three_year),
                     "kline": kline,
                 })
-                logger.info(f"  ✓ {code} {meta['name']} - {len(kline)} days")
+                logger.info(f"  ✓ {code} {meta['name']} - {len(kline)} days, price={current_price}")
             except Exception as e:
                 logger.error(f"  ✗ {code}: {e}")
                 continue
 
-        # Fetch index data
-        indices = []
-        for idx_code, idx_name in [("000001", "上证指数"), ("399001", "深证成指"), ("399006", "创业板指")]:
-            try:
-                idx_df = ak.stock_zh_index_spot_em(symbol=idx_code)
-                if idx_df is not None and not idx_df.empty:
-                    row = idx_df.iloc[0]
-                    indices.append({
-                        "name": idx_name,
-                        "val": round(float(row.get("最新价", 0)), 2),
-                        "chg": round(float(row.get("涨跌幅", 0)), 2),
-                    })
-            except Exception:
-                pass
-
+        indices = _fetch_em_indices()
         if not indices:
             indices = _mock_indices()
 
@@ -171,18 +204,15 @@ def fetch_real_data():
                 "etfs": etfs,
                 "indices": indices,
                 "updated": datetime.now().isoformat(),
-                "source": "akshare",
+                "source": "akshare",  # keep label for frontend badge
             }
             _save_cache()
             logger.info(f"Real data fetched: {len(etfs)} ETFs")
-            signal.alarm(0)
             return True
-        signal.alarm(0)
         return False
 
-    except (Exception, TimeoutError) as e:
-        signal.alarm(0)
-        logger.error(f"AKShare fetch failed: {e}")
+    except Exception as e:
+        logger.error(f"EastMoney HTTP fetch failed: {e}")
         return False
 
 
