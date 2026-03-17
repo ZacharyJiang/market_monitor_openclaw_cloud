@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ETF NEXUS — A股场内ETF数据终端</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script>
+tailwind.config={theme:{extend:{fontFamily:{display:['Orbitron','sans-serif'],body:['Noto Sans SC','sans-serif'],mono:['JetBrains Mono','monospace']},colors:{neon:{cyan:'#00f0ff',pink:'#ff2d7b',green:'#00ff88',red:'#ff3b3b',yellow:'#ffd000'},surface:{900:'#06080d',800:'#0c1017',700:'#121822',600:'#1a2233'}}}}}
+</script>
+<style>
+*,*::before,*::after{box-sizing:border-box}
+::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:#0c1017}::-webkit-scrollbar-thumb{background:#1a2233;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#00f0ff33}
+body{background:#06080d}
+.glass{background:rgba(12,16,23,.7);backdrop-filter:blur(20px);border:1px solid rgba(0,240,255,.08)}
+.glass-strong{background:rgba(18,24,34,.85);backdrop-filter:blur(30px);border:1px solid rgba(0,240,255,.12)}
+body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,240,255,.008) 2px,rgba(0,240,255,.008) 4px);pointer-events:none;z-index:9999}
+body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;background-image:radial-gradient(rgba(0,240,255,.03) 1px,transparent 1px);background-size:30px 30px;pointer-events:none;z-index:0}
+.glow-text{text-shadow:0 0 10px rgba(0,240,255,.5),0 0 30px rgba(0,240,255,.2)}
+.glow-border{box-shadow:0 0 15px rgba(0,240,255,.1),inset 0 0 15px rgba(0,240,255,.05)}
+.neon-line{height:1px;background:linear-gradient(90deg,transparent,#00f0ff,transparent)}
+@keyframes pulse-glow{0%,100%{opacity:.5}50%{opacity:1}}
+@keyframes slide-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.animate-slide-in{animation:slide-in .4s ease-out forwards}
+.pulse-dot{animation:pulse-glow 2s ease-in-out infinite}
+.etf-table{border-collapse:separate;border-spacing:0;width:100%}
+.etf-table thead th{position:sticky;top:0;z-index:20;background:rgba(6,8,13,.95);backdrop-filter:blur(10px);padding:10px 12px;font-size:12px;font-weight:500;text-transform:uppercase;letter-spacing:.5px;color:rgba(0,240,255,.7);cursor:pointer;white-space:nowrap;border-bottom:1px solid rgba(0,240,255,.15);transition:color .2s;font-family:'JetBrains Mono',monospace}
+.etf-table thead th:hover{color:#00f0ff}
+.etf-table thead th.sorted-asc::after{content:' ▲';color:#00f0ff}
+.etf-table thead th.sorted-desc::after{content:' ▼';color:#00f0ff}
+.etf-table tbody tr{transition:background .2s;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.03)}
+.etf-table tbody tr:hover{background:rgba(0,240,255,.04)}
+.etf-table tbody td{padding:8px 12px;font-size:13px;white-space:nowrap;font-family:'JetBrains Mono',monospace;font-weight:400;border-bottom:1px solid rgba(255,255,255,.03)}
+.sparkline-container{width:120px;height:36px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.8);backdrop-filter:blur(8px);z-index:1000;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity .3s}
+.modal-overlay.active{opacity:1;pointer-events:all}
+.modal-content{background:#0c1017;border:1px solid rgba(0,240,255,.15);border-radius:12px;width:90vw;max-width:1000px;max-height:85vh;box-shadow:0 0 60px rgba(0,240,255,.1),0 25px 50px rgba(0,0,0,.5);transform:scale(.95);transition:transform .3s;overflow:hidden}
+.modal-overlay.active .modal-content{transform:scale(1)}
+.filter-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.filter-group{display:flex;flex-direction:column;gap:3px}
+.filter-group label{font-size:10px;color:rgba(0,240,255,.5);text-transform:uppercase;letter-spacing:.5px;font-family:'JetBrains Mono',monospace}
+.filter-input{background:rgba(0,240,255,.05);border:1px solid rgba(0,240,255,.12);border-radius:6px;padding:5px 8px;font-size:12px;color:#e2e8f0;font-family:'JetBrains Mono',monospace;width:80px;outline:none;transition:border-color .2s}
+.filter-input:focus{border-color:rgba(0,240,255,.4)}
+.filter-input::placeholder{color:rgba(255,255,255,.2)}
+.market-item{display:flex;align-items:center;gap:8px;padding:0 20px}
+.time-btn{padding:4px 12px;border-radius:4px;font-size:12px;background:rgba(0,240,255,.05);border:1px solid rgba(0,240,255,.1);color:rgba(255,255,255,.5);cursor:pointer;transition:all .2s;font-family:'JetBrains Mono',monospace}
+.time-btn:hover,.time-btn.active{background:rgba(0,240,255,.15);border-color:rgba(0,240,255,.4);color:#00f0ff}
+.source-badge{font-size:9px;padding:2px 6px;border-radius:3px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:1px}
+.source-live{background:rgba(0,255,136,.15);color:#00ff88;border:1px solid rgba(0,255,136,.3)}
+.source-mock{background:rgba(255,208,0,.1);color:#ffd000;border:1px solid rgba(255,208,0,.2)}
+.loading-overlay{position:fixed;inset:0;z-index:2000;background:#06080d;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity .5s}
+.loading-overlay.done{opacity:0;pointer-events:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spinner{width:40px;height:40px;border:3px solid rgba(0,240,255,.1);border-top-color:#00f0ff;border-radius:50%;animation:spin .8s linear infinite}
+@media(max-width:768px){.etf-table{font-size:11px}.etf-table tbody td,.etf-table thead th{padding:6px 8px}.sparkline-container{width:80px;height:28px}.filter-row{gap:6px}.filter-input{width:60px;font-size:11px}.modal-content{width:96vw;max-height:90vh}}
+</style>
+</head>
+<body class="bg-surface-900 text-gray-200 font-body min-h-screen">
+<!-- Loading Screen -->
+<div class="loading-overlay" id="loadingScreen">
+  <div class="spinner"></div>
+  <p class="mt-4 text-xs text-neon-cyan/60 font-mono tracking-widest">LOADING DATA...</p>
+</div>
+
+<div class="relative z-10">
+  <!-- TOP BAR -->
+  <div class="glass border-b border-cyan-900/20">
+    <div class="max-w-[1600px] mx-auto px-4 py-2 flex items-center justify-between flex-wrap gap-2">
+      <div class="flex items-center gap-2">
+        <div class="w-2 h-2 rounded-full bg-neon-cyan pulse-dot"></div>
+        <span class="font-display text-xs text-neon-cyan tracking-widest">LIVE</span>
+        <span class="source-badge source-mock" id="sourceBadge">—</span>
+      </div>
+      <div id="marketTicker" class="flex items-center gap-0 overflow-hidden flex-1 mx-4"></div>
+      <div class="text-[10px] text-gray-500 font-mono" id="updateTime"></div>
+    </div>
+  </div>
+
+  <!-- HEADER -->
+  <header class="max-w-[1600px] mx-auto px-4 pt-6 pb-4">
+    <div class="flex items-end justify-between flex-wrap gap-4">
+      <div>
+        <h1 class="font-display text-2xl md:text-3xl font-black tracking-wider text-white glow-text">ETF<span class="text-neon-cyan">NEXUS</span></h1>
+        <p class="text-xs text-gray-500 mt-1 font-mono tracking-wide">A股场内ETF实时数据终端 · CHINA A-SHARE ETF TRACKER</p>
+      </div>
+      <span class="text-xs text-gray-500 font-mono" id="statsInfo"></span>
+    </div>
+    <div class="neon-line mt-4 opacity-40"></div>
+  </header>
+
+  <!-- SEARCH & FILTERS -->
+  <section class="max-w-[1600px] mx-auto px-4 pb-4">
+    <div class="glass-strong rounded-xl p-4 glow-border">
+      <div class="flex items-center gap-3 mb-3">
+        <div class="relative flex-1 max-w-xs">
+          <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neon-cyan/40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+          <input type="text" id="searchInput" placeholder="搜索ETF名称或代码..." class="filter-input w-full pl-9 py-2" style="width:100%">
+        </div>
+        <button id="toggleFilters" class="time-btn text-xs flex items-center gap-1">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z"/></svg>
+          筛选
+        </button>
+        <button id="resetFilters" class="time-btn text-xs" style="color:rgba(255,45,123,.7);border-color:rgba(255,45,123,.2)">重置</button>
+      </div>
+      <div id="filterPanel" class="filter-row" style="display:none"></div>
+    </div>
+  </section>
+
+  <!-- TABLE -->
+  <section class="max-w-[1600px] mx-auto px-4 pb-8">
+    <div class="glass-strong rounded-xl glow-border overflow-auto" style="max-height:calc(100vh - 300px)">
+      <table class="etf-table" id="etfTable">
+        <thead><tr id="tableHead"></tr></thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<!-- K-LINE MODAL -->
+<div class="modal-overlay" id="klineModal">
+  <div class="modal-content">
+    <div class="flex items-center justify-between p-4 border-b border-cyan-900/20">
+      <div>
+        <h3 class="font-display text-lg text-white" id="modalTitle">—</h3>
+        <p class="text-xs text-gray-500 font-mono" id="modalSubtitle">—</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <div id="timeButtons" class="flex gap-1"></div>
+        <button id="closeModal" class="ml-3 w-8 h-8 rounded-lg flex items-center justify-center bg-white/5 hover:bg-white/10 transition">
+          <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+    </div>
+    <div id="klineChart" style="width:100%;height:480px;"></div>
+  </div>
+</div>
+<script>
+// ============================================================
+// STATE & CONFIG
+// ============================================================
+let ETF_DATA = [];
+let dataSource = 'loading';
+const state = { sortKey:'scale', sortDir:'desc', search:'', filters:{}, modalETF:null, modalRange:'1Y' };
+const COLUMNS = [
+  {key:'name',label:'ETF名称',sortable:false,filterable:false},
+  {key:'code',label:'代码',sortable:false,filterable:false},
+  {key:'scale',label:'规模(亿)',sortable:true,filterable:true},
+  {key:'currentPrice',label:'现价',sortable:true,filterable:true},
+  {key:'fee',label:'费率%',sortable:true,filterable:true},
+  {key:'sparkline',label:'K线',sortable:false,filterable:false},
+  {key:'dropFromHigh',label:'离最高跌幅%',sortable:true,filterable:true},
+  {key:'riseFromLow',label:'离最低涨幅%',sortable:true,filterable:true},
+  {key:'maxDD1Y',label:'1年最大回撤%',sortable:true,filterable:true},
+  {key:'maxDD3Y',label:'3年最大回撤%',sortable:true,filterable:true},
+];
+const FILTER_KEYS = COLUMNS.filter(c=>c.filterable).map(c=>c.key);
+
+// ============================================================
+// API FETCH
+// ============================================================
+async function fetchData() {
+  try {
+    const res = await fetch('/api/etf-data');
+    const json = await res.json();
+    ETF_DATA = json.etfs || [];
+    dataSource = json.source || 'unknown';
+    // Render market ticker
+    renderMarketTicker(json.indices || [], json.updated);
+    // Update source badge
+    const badge = document.getElementById('sourceBadge');
+    if (dataSource === 'akshare') {
+      badge.textContent = 'LIVE'; badge.className = 'source-badge source-live';
+    } else {
+      badge.textContent = 'DEMO'; badge.className = 'source-badge source-mock';
+    }
+    renderTable();
+    // Hide loading
+    document.getElementById('loadingScreen').classList.add('done');
+    setTimeout(() => document.getElementById('loadingScreen').style.display='none', 600);
+  } catch(e) {
+    console.error('Fetch failed:', e);
+    document.getElementById('loadingScreen').innerHTML = '<p class="text-red-400 font-mono text-sm">数据加载失败，请刷新重试</p>';
+  }
+}
+
+// Auto-refresh every 60s
+setInterval(fetchData, 60000);
+
+// ============================================================
+// MARKET TICKER
+// ============================================================
+function renderMarketTicker(indices, updated) {
+  const el = document.getElementById('marketTicker');
+  el.innerHTML = indices.map(idx => {
+    const color = idx.chg >= 0 ? 'text-neon-red' : 'text-neon-green';
+    const arrow = idx.chg >= 0 ? '▲' : '▼';
+    return `<div class="market-item">
+      <span class="text-xs text-gray-400">${idx.name}</span>
+      <span class="text-sm font-mono font-bold text-white">${Number(idx.val).toLocaleString()}</span>
+      <span class="text-xs font-mono font-bold ${color}">${arrow} ${Math.abs(idx.chg)}%</span>
+    </div>`;
+  }).join('');
+  document.getElementById('updateTime').textContent = updated ? '更新: ' + new Date(updated).toLocaleString('zh-CN') : '';
+}
+
+// ============================================================
+// FILTER PANEL
+// ============================================================
+function renderFilterPanel() {
+  const panel = document.getElementById('filterPanel');
+  panel.innerHTML = FILTER_KEYS.map(key => {
+    const col = COLUMNS.find(c=>c.key===key);
+    return `<div class="filter-group"><label>${col.label}</label><div class="flex gap-1">
+      <input type="number" step="any" class="filter-input" placeholder="最小" data-filter="${key}" data-bound="min">
+      <span class="text-gray-600 text-xs self-center">–</span>
+      <input type="number" step="any" class="filter-input" placeholder="最大" data-filter="${key}" data-bound="max">
+    </div></div>`;
+  }).join('');
+  panel.querySelectorAll('.filter-input').forEach(inp => {
+    inp.addEventListener('input', () => {
+      const key=inp.dataset.filter, bound=inp.dataset.bound;
+      if(!state.filters[key]) state.filters[key]={};
+      state.filters[key][bound] = inp.value==='' ? null : parseFloat(inp.value);
+      renderTable();
+    });
+  });
+}
+
+// ============================================================
+// TABLE
+// ============================================================
+function getFilteredSorted() {
+  let data = [...ETF_DATA];
+  if (state.search) {
+    const q = state.search.toLowerCase();
+    data = data.filter(d => d.name.toLowerCase().includes(q) || d.code.includes(q));
+  }
+  for (const key of FILTER_KEYS) {
+    const f = state.filters[key]; if(!f) continue;
+    if(f.min!=null) data=data.filter(d=>d[key]>=f.min);
+    if(f.max!=null) data=data.filter(d=>d[key]<=f.max);
+  }
+  if (state.sortKey) {
+    data.sort((a,b)=>{
+      let va=a[state.sortKey],vb=b[state.sortKey];
+      if(typeof va==='string'){va=va.toLowerCase();vb=vb.toLowerCase();}
+      if(va<vb) return state.sortDir==='asc'?-1:1;
+      if(va>vb) return state.sortDir==='asc'?1:-1;
+      return 0;
+    });
+  }
+  return data;
+}
+
+function renderTableHead() {
+  const tr = document.getElementById('tableHead');
+  tr.innerHTML = COLUMNS.map(col=>{
+    let cls='';
+    if(col.sortable && state.sortKey===col.key) cls=state.sortDir==='asc'?'sorted-asc':'sorted-desc';
+    return `<th class="${cls}" data-key="${col.key}" data-sortable="${col.sortable}">${col.label}</th>`;
+  }).join('');
+  tr.querySelectorAll('th[data-sortable="true"]').forEach(th=>{
+    th.addEventListener('click',()=>{
+      const key=th.dataset.key;
+      if(state.sortKey===key) state.sortDir=state.sortDir==='asc'?'desc':'asc';
+      else{state.sortKey=key;state.sortDir='desc';}
+      renderTable();
+    });
+  });
+}
+
+let sparkCharts={};
+function renderTable() {
+  Object.values(sparkCharts).forEach(c=>c.dispose()); sparkCharts={};
+  const data = getFilteredSorted();
+  document.getElementById('statsInfo').textContent=`${data.length} / ${ETF_DATA.length} 支ETF`;
+  const tbody = document.getElementById('tableBody');
+  tbody.innerHTML = data.map((etf,i)=>{
+    const spark = etf.sparkline||[];
+    const isUp = spark.length>=2 && spark[spark.length-1]>=spark[spark.length-2];
+    const priceColor = isUp?'text-red-400':'text-green-400';
+    return `<tr class="animate-slide-in" style="animation-delay:${Math.min(i*20,400)}ms" data-code="${etf.code}">
+      <td class="text-white font-body font-medium text-sm">${etf.name}</td>
+      <td class="text-gray-500">${etf.code}</td>
+      <td>${Number(etf.scale).toLocaleString()}</td>
+      <td class="${priceColor} font-bold">${Number(etf.currentPrice).toFixed(3)}</td>
+      <td class="text-gray-400">${Number(etf.fee).toFixed(2)}</td>
+      <td><div class="sparkline-container" id="spark-${etf.code}"></div></td>
+      <td class="text-green-400">${Number(etf.dropFromHigh).toFixed(2)}</td>
+      <td class="text-red-400">+${Number(etf.riseFromLow).toFixed(2)}</td>
+      <td class="text-yellow-400">${Number(etf.maxDD1Y).toFixed(2)}</td>
+      <td class="text-orange-400">${Number(etf.maxDD3Y).toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+  renderTableHead();
+  // Row click -> kline modal
+  tbody.querySelectorAll('tr').forEach(tr=>{
+    tr.addEventListener('click',()=>{
+      state.modalETF=ETF_DATA.find(e=>e.code===tr.dataset.code);
+      state.modalRange='1Y'; openModal();
+    });
+  });
+  // Sparklines
+  requestAnimationFrame(()=>{
+    data.forEach(etf=>{
+      const el=document.getElementById('spark-'+etf.code); if(!el) return;
+      const chart=echarts.init(el,null,{renderer:'canvas'}); sparkCharts[etf.code]=chart;
+      const closes=etf.sparkline||[];
+      const up=closes.length>=2&&closes[closes.length-1]>=closes[0];
+      chart.setOption({
+        grid:{top:2,bottom:2,left:2,right:2},
+        xAxis:{show:false,data:closes.map((_,i)=>i)},
+        yAxis:{show:false,min:'dataMin',max:'dataMax'},
+        series:[{type:'line',data:closes,smooth:true,symbol:'none',
+          lineStyle:{width:1.5,color:up?'#ff3b3b':'#00ff88'},
+          areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[
+            {offset:0,color:up?'rgba(255,59,59,.25)':'rgba(0,255,136,.25)'},
+            {offset:1,color:'transparent'}
+          ])}
+        }],animation:false
+      });
+    });
+  });
+}
+
+// ============================================================
+// K-LINE MODAL (fetches from /api/kline/:code)
+// ============================================================
+async function openModal() {
+  const etf=state.modalETF; if(!etf) return;
+  document.getElementById('modalTitle').textContent=etf.name;
+  document.getElementById('modalSubtitle').textContent=etf.code+' · 费率'+etf.fee+'% · 规模'+etf.scale+'亿';
+  document.getElementById('klineModal').classList.add('active');
+  renderTimeButtons();
+  await renderKlineChart();
+}
+function closeModalFn(){document.getElementById('klineModal').classList.remove('active');state.modalETF=null;}
+function renderTimeButtons(){
+  const ranges=['1M','3M','6M','1Y','3Y','全部'];
+  const c=document.getElementById('timeButtons');
+  c.innerHTML=ranges.map(r=>`<button class="time-btn ${state.modalRange===r?'active':''}" data-range="${r}">${r}</button>`).join('');
+  c.querySelectorAll('.time-btn').forEach(btn=>{
+    btn.addEventListener('click',()=>{state.modalRange=btn.dataset.range;renderTimeButtons();renderKlineChart();});
+  });
+}
+function calcMA(kline,period){
+  const r=[];
+  for(let i=0;i<kline.length;i++){
+    if(i<period-1){r.push(null);continue;}
+    let s=0;for(let j=0;j<period;j++) s+=kline[i-j].close;
+    r.push(+(s/period).toFixed(4));
+  }
+  return r;
+}
+async function renderKlineChart(){
+  const etf=state.modalETF; if(!etf) return;
+  try{
+    const res=await fetch(`/api/kline/${etf.code}?range=${encodeURIComponent(state.modalRange)}`);
+    const json=await res.json();
+    const kline=json.kline||[];
+    const dates=kline.map(k=>k.date);
+    const ohlc=kline.map(k=>[k.open,k.close,k.low,k.high]);
+    const volumes=kline.map(k=>k.volume);
+    const ma5=calcMA(kline,5),ma10=calcMA(kline,10),ma20=calcMA(kline,20);
+    const dom=document.getElementById('klineChart');
+    let chart=echarts.getInstanceByDom(dom);
+    if(!chart) chart=echarts.init(dom,null,{renderer:'canvas'});
+    chart.setOption({
+      backgroundColor:'transparent',animation:true,
+      tooltip:{trigger:'axis',axisPointer:{type:'cross'},backgroundColor:'rgba(6,8,13,.9)',borderColor:'rgba(0,240,255,.2)',textStyle:{color:'#e2e8f0',fontFamily:'JetBrains Mono',fontSize:12}},
+      axisPointer:{link:[{xAxisIndex:'all'}]},
+      grid:[{left:60,right:20,top:20,height:'60%'},{left:60,right:20,top:'76%',height:'16%'}],
+      xAxis:[
+        {type:'category',data:dates,gridIndex:0,axisLine:{lineStyle:{color:'#1a2233'}},axisLabel:{color:'#555',fontFamily:'JetBrains Mono',fontSize:10},splitLine:{show:false},boundaryGap:true,min:'dataMin',max:'dataMax'},
+        {type:'category',data:dates,gridIndex:1,axisLine:{lineStyle:{color:'#1a2233'}},axisLabel:{show:false},splitLine:{show:false},boundaryGap:true,min:'dataMin',max:'dataMax'}
+      ],
+      yAxis:[
+        {scale:true,gridIndex:0,axisLine:{show:false},axisTick:{show:false},splitLine:{lineStyle:{color:'rgba(0,240,255,.05)'}},axisLabel:{color:'#555',fontFamily:'JetBrains Mono',fontSize:10}},
+        {scale:true,gridIndex:1,axisLine:{show:false},axisTick:{show:false},splitLine:{show:false},axisLabel:{show:false}}
+      ],
+      dataZoom:[{type:'inside',xAxisIndex:[0,1],start:0,end:100}],
+      series:[
+        {name:'K线',type:'candlestick',data:ohlc,xAxisIndex:0,yAxisIndex:0,itemStyle:{color:'#ff3b3b',color0:'#00d47e',borderColor:'#ff3b3b',borderColor0:'#00d47e',borderWidth:1}},
+        {name:'MA5',type:'line',data:ma5,smooth:true,symbol:'none',lineStyle:{width:1,color:'#ffd000'},xAxisIndex:0,yAxisIndex:0},
+        {name:'MA10',type:'line',data:ma10,smooth:true,symbol:'none',lineStyle:{width:1,color:'#00f0ff'},xAxisIndex:0,yAxisIndex:0},
+        {name:'MA20',type:'line',data:ma20,smooth:true,symbol:'none',lineStyle:{width:1,color:'#ff2d7b'},xAxisIndex:0,yAxisIndex:0},
+        {name:'成交量',type:'bar',xAxisIndex:1,yAxisIndex:1,data:volumes.map((v,i)=>({value:v,itemStyle:{color:ohlc[i][1]>=ohlc[i][0]?'rgba(255,59,59,.5)':'rgba(0,212,126,.5)'}}))}
+      ]
+    },true);
+    window.addEventListener('resize',()=>chart.resize(),{once:true});
+  }catch(e){console.error('Kline fetch error:',e);}
+}
+
+// ============================================================
+// EVENT BINDINGS & INIT
+// ============================================================
+document.getElementById('searchInput').addEventListener('input',e=>{state.search=e.target.value.trim();renderTable();});
+document.getElementById('toggleFilters').addEventListener('click',()=>{
+  const p=document.getElementById('filterPanel');p.style.display=p.style.display==='none'?'flex':'none';
+});
+document.getElementById('resetFilters').addEventListener('click',()=>{
+  state.search='';state.filters={};document.getElementById('searchInput').value='';
+  document.querySelectorAll('#filterPanel .filter-input').forEach(i=>i.value='');renderTable();
+});
+document.getElementById('closeModal').addEventListener('click',closeModalFn);
+document.getElementById('klineModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModalFn();});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModalFn();});
+window.addEventListener('resize',()=>{Object.values(sparkCharts).forEach(c=>c.resize());});
+
+renderFilterPanel();
+fetchData();
+</script>
+</body>
+</html>

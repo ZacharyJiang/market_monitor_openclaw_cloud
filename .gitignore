@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+etf_cache.json
+.env
