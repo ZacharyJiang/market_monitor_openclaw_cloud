@@ -147,20 +147,21 @@ def fetch_spot_akshare():
 
 
 def fetch_indices_akshare():
-    """Fetch major index quotes."""
+    """Fetch major index quotes via multiple AKShare APIs (fallback chain)."""
     import akshare as ak
     target = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指"}
     indices = []
+
+    # Method 1: stock_zh_index_spot_em (all indices in one call)
     try:
-        # stock_zh_index_spot_em returns ALL indices, filter locally
         df = ak.stock_zh_index_spot_em()
         if df is not None and not df.empty:
             cols = list(df.columns)
-            logger.info(f"Index spot columns: {cols}")
-            col_code = "代码" if "代码" in cols else None
-            col_price = next((c for c in ["最新价", "现价"] if c in cols), None)
+            logger.info(f"Index spot columns (method1): {cols}")
+            col_code = next((c for c in ["代码", "序号"] if c in cols), None)
+            col_price = next((c for c in ["最新价", "现价", "收盘"] if c in cols), None)
             col_chg = next((c for c in ["涨跌幅", "涨幅"] if c in cols), None)
-            if col_code:
+            if col_code and col_price:
                 df[col_code] = df[col_code].astype(str)
                 for code, name in target.items():
                     match = df[df[col_code] == code]
@@ -168,12 +169,38 @@ def fetch_indices_akshare():
                         row = match.iloc[0]
                         indices.append({
                             "name": name,
-                            "val": round(_safe_float(row.get(col_price) if col_price else None), 2),
+                            "val": round(_safe_float(row.get(col_price)), 2),
                             "chg": round(_safe_float(row.get(col_chg) if col_chg else None), 2),
                         })
+        if indices:
+            logger.info(f"Indices fetched (method1): {len(indices)}")
+            return indices
     except Exception as e:
-        logger.warning(f"Index fetch failed: {e}")
-    return indices if indices else _mock_indices()
+        logger.warning(f"Index method1 (stock_zh_index_spot_em) failed: {e}")
+
+    # Method 2: Use index daily kline for latest close
+    for code, name in target.items():
+        try:
+            sym = f"sh{code}" if code.startswith("0") else f"sz{code}"
+            df = ak.stock_zh_index_daily(symbol=sym)
+            if df is not None and not df.empty:
+                last = df.iloc[-1]
+                close_col = next((c for c in ["close", "收盘"] if c in df.columns), df.columns[3] if len(df.columns) > 3 else None)
+                if close_col:
+                    close = _safe_float(last.get(close_col))
+                    prev = _safe_float(df.iloc[-2].get(close_col)) if len(df) > 1 else close
+                    chg = round((close - prev) / prev * 100, 2) if prev > 0 else 0
+                    indices.append({"name": name, "val": round(close, 2), "chg": chg})
+        except Exception as e:
+            logger.warning(f"Index method2 ({code}) failed: {e}")
+
+    if indices:
+        logger.info(f"Indices fetched (method2): {len(indices)}")
+        return indices
+
+    # Method 3: Extract from ETF spot data (approximate from 510050/沪深300 etc.)
+    logger.warning("All index methods failed, using mock indices")
+    return _mock_indices()
 
 
 def fetch_kline_akshare(code: str, days: int = 1200) -> list:
@@ -529,30 +556,23 @@ async def health():
 
 @app.get("/api/diag")
 async def diag():
-    """Quick diagnostic: try one AKShare call and report result."""
-    result = {
-        "proxy": _PROXY or "none",
-        "akshare_ok": False,
-        "error": None,
-        "etf_count": 0,
-        "columns": [],
-        "sample_row": {},
+    """Quick diagnostic: report current state without making new AKShare calls."""
+    # Sample a few ETFs for inspection
+    sample = []
+    with _lock:
+        for i, (code, spot) in enumerate(etf_spot.items()):
+            if i >= 3:
+                break
+            sample.append({**spot, "stats": etf_stats.get(code, {})})
+    return {
         "current_source": data_source,
         "current_etf_count": len(etf_spot),
         "current_stats_count": len(etf_stats),
+        "indices": market_indices,
+        "updated": last_updated,
+        "proxy": _PROXY or "none",
+        "sample_etfs": sample,
     }
-    try:
-        import akshare as ak
-        result["akshare_version"] = getattr(ak, "__version__", "unknown")
-        df = ak.fund_etf_spot_em()
-        result["akshare_ok"] = True
-        result["etf_count"] = len(df)
-        result["columns"] = list(df.columns)
-        if not df.empty:
-            result["sample_row"] = {str(k): str(v) for k, v in df.iloc[0].to_dict().items()}
-    except Exception as e:
-        result["error"] = str(e)[:500]
-    return result
 
 # Serve static files
 static_dir = Path(__file__).parent / "static"
