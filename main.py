@@ -68,30 +68,79 @@ KNOWN_FEES = {
 # ============================================================
 # AKSHARE FETCHERS
 # ============================================================
+def _safe_float(val, default=0):
+    """Safely convert to float, return default on failure."""
+    try:
+        v = float(val) if val is not None and str(val).strip() not in ("", "-", "nan", "None") else default
+        return v
+    except (ValueError, TypeError):
+        return default
+
+
 def fetch_spot_akshare():
     """Fetch ALL ETF spot data via AKShare. Returns dict {code: row_dict}."""
     import akshare as ak
     logger.info("AKShare: fetching spot data for all ETFs...")
     df = ak.fund_etf_spot_em()
+    cols = list(df.columns)
+    logger.info(f"AKShare spot columns: {cols}")
     df["代码"] = df["代码"].astype(str).str.zfill(6)
+
+    # Detect column names (AKShare changes these across versions)
+    def _find_col(candidates, df_cols):
+        for c in candidates:
+            if c in df_cols:
+                return c
+        return None
+
+    col_price = _find_col(["最新价", "现价", "收盘价"], cols)
+    col_name = _find_col(["名称", "基金名称"], cols)
+    col_chg = _find_col(["涨跌幅", "涨幅"], cols)
+    col_vol = _find_col(["成交量"], cols)
+    col_amt = _find_col(["成交额"], cols)
+    col_scale = _find_col(["总市值", "市值", "基金规模"], cols)
+    col_open = _find_col(["开盘价", "开盘", "今开"], cols)
+    col_high = _find_col(["最高价", "最高"], cols)
+    col_low = _find_col(["最低价", "最低"], cols)
+    col_prev = _find_col(["昨收", "昨收价"], cols)
+
+    logger.info(f"Column mapping: price={col_price}, name={col_name}, chg={col_chg}, "
+                f"vol={col_vol}, amt={col_amt}, scale={col_scale}")
+
     result = {}
     for _, row in df.iterrows():
         code = row["代码"]
         try:
-            price = float(row.get("最新价", 0) or 0)
+            price = _safe_float(row.get(col_price) if col_price else None)
             if price <= 0:
                 continue
+            # Scale: try 总市值 first, else estimate from 成交额/换手率 if available
+            scale_raw = _safe_float(row.get(col_scale) if col_scale else None)
+            if scale_raw > 1e6:  # Likely in yuan, convert to 亿
+                scale = round(scale_raw / 1e8, 2)
+            elif scale_raw > 0:  # Might already be in 亿
+                scale = round(scale_raw, 2)
+            else:
+                # Estimate: daily turnover / turnover_rate ≈ total market cap
+                amt = _safe_float(row.get(col_amt) if col_amt else None)
+                scale = round(amt / 1e8, 2) if amt > 0 else 0
+
             result[code] = {
                 "code": code,
-                "name": str(row.get("名称", "")),
+                "name": str(row.get(col_name, "") if col_name else ""),
                 "currentPrice": round(price, 4),
-                "chgPct": round(float(row.get("涨跌幅", 0) or 0), 2),
-                "scale": round(float(row.get("总市值", 0) or 0) / 1e8, 2),
-                "volume": int(float(row.get("成交量", 0) or 0)),
-                "turnover": round(float(row.get("成交额", 0) or 0) / 1e8, 2),
+                "chgPct": round(_safe_float(row.get(col_chg) if col_chg else None), 2),
+                "scale": scale,
+                "volume": int(_safe_float(row.get(col_vol) if col_vol else None)),
+                "turnover": round(_safe_float(row.get(col_amt) if col_amt else None) / 1e8, 2),
                 "fee": KNOWN_FEES.get(code, DEFAULT_FEE),
+                "open": round(_safe_float(row.get(col_open) if col_open else None), 4),
+                "high": round(_safe_float(row.get(col_high) if col_high else None), 4),
+                "low": round(_safe_float(row.get(col_low) if col_low else None), 4),
+                "prevClose": round(_safe_float(row.get(col_prev) if col_prev else None), 4),
             }
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Spot parse error for {code}: {e}")
             continue
     logger.info(f"AKShare: spot data fetched for {len(result)} ETFs")
     return result
@@ -100,19 +149,30 @@ def fetch_spot_akshare():
 def fetch_indices_akshare():
     """Fetch major index quotes."""
     import akshare as ak
+    target = {"000001": "上证指数", "399001": "深证成指", "399006": "创业板指"}
     indices = []
-    for code, name in [("000001", "上证指数"), ("399001", "深证成指"), ("399006", "创业板指")]:
-        try:
-            df = ak.stock_zh_index_spot_em(symbol=code)
-            if df is not None and not df.empty:
-                row = df.iloc[0]
-                indices.append({
-                    "name": name,
-                    "val": round(float(row.get("最新价", 0)), 2),
-                    "chg": round(float(row.get("涨跌幅", 0)), 2),
-                })
-        except Exception as e:
-            logger.warning(f"Index {code} fetch failed: {e}")
+    try:
+        # stock_zh_index_spot_em returns ALL indices, filter locally
+        df = ak.stock_zh_index_spot_em()
+        if df is not None and not df.empty:
+            cols = list(df.columns)
+            logger.info(f"Index spot columns: {cols}")
+            col_code = "代码" if "代码" in cols else None
+            col_price = next((c for c in ["最新价", "现价"] if c in cols), None)
+            col_chg = next((c for c in ["涨跌幅", "涨幅"] if c in cols), None)
+            if col_code:
+                df[col_code] = df[col_code].astype(str)
+                for code, name in target.items():
+                    match = df[df[col_code] == code]
+                    if not match.empty:
+                        row = match.iloc[0]
+                        indices.append({
+                            "name": name,
+                            "val": round(_safe_float(row.get(col_price) if col_price else None), 2),
+                            "chg": round(_safe_float(row.get(col_chg) if col_chg else None), 2),
+                        })
+    except Exception as e:
+        logger.warning(f"Index fetch failed: {e}")
     return indices if indices else _mock_indices()
 
 
@@ -127,16 +187,23 @@ def fetch_kline_akshare(code: str, days: int = 1200) -> list:
     )
     if hist is None or hist.empty:
         return []
+    cols = list(hist.columns)
+    col_date = next((c for c in ["日期", "date"] if c in cols), cols[0])
+    col_open = next((c for c in ["开盘", "开盘价", "open"] if c in cols), cols[1] if len(cols) > 1 else None)
+    col_close = next((c for c in ["收盘", "收盘价", "close"] if c in cols), cols[2] if len(cols) > 2 else None)
+    col_high = next((c for c in ["最高", "最高价", "high"] if c in cols), cols[3] if len(cols) > 3 else None)
+    col_low = next((c for c in ["最低", "最低价", "low"] if c in cols), cols[4] if len(cols) > 4 else None)
+    col_vol = next((c for c in ["成交量", "volume"] if c in cols), cols[5] if len(cols) > 5 else None)
     kline = []
     for _, r in hist.iterrows():
         try:
             kline.append({
-                "date": str(r["日期"])[:10],
-                "open": round(float(r["开盘"]), 4),
-                "close": round(float(r["收盘"]), 4),
-                "high": round(float(r["最高"]), 4),
-                "low": round(float(r["最低"]), 4),
-                "volume": int(float(r["成交量"])),
+                "date": str(r[col_date])[:10],
+                "open": round(_safe_float(r.get(col_open)), 4),
+                "close": round(_safe_float(r.get(col_close)), 4),
+                "high": round(_safe_float(r.get(col_high)), 4),
+                "low": round(_safe_float(r.get(col_low)), 4),
+                "volume": int(_safe_float(r.get(col_vol))),
             })
         except (ValueError, TypeError):
             continue
@@ -369,11 +436,14 @@ scheduler = BackgroundScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     loaded = load_spot_cache()
-    if not loaded:
-        try:
-            refresh_spot()
-        except Exception:
-            pass
+    # Always try a live refresh at startup, even if cache was loaded
+    # This ensures we don't stay stuck on mock data forever
+    try:
+        logger.info("Startup: attempting live AKShare refresh...")
+        refresh_spot()
+        logger.info(f"Startup: live refresh succeeded, source={data_source}, {len(etf_spot)} ETFs")
+    except Exception as e:
+        logger.error(f"Startup: live refresh failed: {e}")
         if not etf_spot:
             generate_mock()
     # Spot refresh every N minutes
@@ -460,12 +530,26 @@ async def health():
 @app.get("/api/diag")
 async def diag():
     """Quick diagnostic: try one AKShare call and report result."""
-    result = {"proxy": _PROXY or "none", "akshare_ok": False, "error": None, "etf_count": 0}
+    result = {
+        "proxy": _PROXY or "none",
+        "akshare_ok": False,
+        "error": None,
+        "etf_count": 0,
+        "columns": [],
+        "sample_row": {},
+        "current_source": data_source,
+        "current_etf_count": len(etf_spot),
+        "current_stats_count": len(etf_stats),
+    }
     try:
         import akshare as ak
+        result["akshare_version"] = getattr(ak, "__version__", "unknown")
         df = ak.fund_etf_spot_em()
         result["akshare_ok"] = True
         result["etf_count"] = len(df)
+        result["columns"] = list(df.columns)
+        if not df.empty:
+            result["sample_row"] = {str(k): str(v) for k, v in df.iloc[0].to_dict().items()}
     except Exception as e:
         result["error"] = str(e)[:500]
     return result
