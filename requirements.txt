@@ -1,4 +1,5 @@
-akshare>=1.18
 fastapi>=0.115
 uvicorn[standard]>=0.34
 apscheduler>=3.11
+requests==2.32.3
+urllib3==2.4.0
