@@ -21,6 +21,6 @@ services:
       - key: CIRCUIT_BREAKER_COOLDOWN
         value: "300"
       - key: USE_MOCK
-        value: "true"
+        value: "false"
       - key: PYTHON_VERSION
         value: "3.12.0"
