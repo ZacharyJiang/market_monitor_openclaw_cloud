@@ -18,9 +18,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import hmac
+import hashlib
+import subprocess
+
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -1459,6 +1463,51 @@ async def diag():
         "rate_limiter": request_controller.status(),
         "sample_etfs": sample,
     }
+
+
+# ========== Webhook 自动更新路由 ==========
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+REPO_PATH = os.environ.get("REPO_PATH", "/app")
+
+def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
+    """验证 GitHub webhook 签名"""
+    if not secret:
+        return True
+    if not signature:
+        return False
+    expected = "sha256=" + hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+@app.post("/webhook")
+async def github_webhook(request: Request):
+    """GitHub webhook endpoint - 接收 push 事件并自动更新服务"""
+    body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    
+    if not verify_signature(body, signature, WEBHOOK_SECRET):
+        return JSONResponse({"error": "Invalid signature"}, status_code=401)
+    
+    event = request.headers.get("X-GitHub-Event", "")
+    if event != "push":
+        return JSONResponse({"message": f"Ignored event: {event}"}, status_code=200)
+    
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["bash", f"{REPO_PATH}/auto-update.sh"],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        return JSONResponse({
+            "status": "success",
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode
+        })
+    except Exception as e:
+        logger.error(f"Webhook execution failed: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
 static_dir = Path(__file__).parent / "static"
