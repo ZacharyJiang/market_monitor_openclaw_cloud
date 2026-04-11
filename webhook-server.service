@@ -1,0 +1,17 @@
+[Unit]
+Description=GitHub Webhook Server for ETF Monitor
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/market_monitor_openclaw_cloud
+Environment=REPO_PATH=/opt/market_monitor_openclaw_cloud
+Environment=WEBHOOK_SECRET=your_webhook_secret_here
+Environment=WEBHOOK_PORT=8082
+ExecStart=/usr/bin/python3 /opt/market_monitor_openclaw_cloud/webhook-server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
