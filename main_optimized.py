@@ -1480,7 +1480,7 @@ def verify_signature(payload: bytes, signature: str, secret: str) -> bool:
 
 @app.post("/webhook")
 async def github_webhook(request: Request):
-    """GitHub webhook endpoint - 接收 push 事件并自动更新服务"""
+    """GitHub webhook endpoint - 接收 push 事件并自动更新服务（异步执行）"""
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
     
@@ -1493,18 +1493,34 @@ async def github_webhook(request: Request):
     
     try:
         import subprocess
-        result = subprocess.run(
+        # 使用 Popen 立即返回，后台执行更新脚本
+        # 脚本会自己启动后台进程并立即返回
+        process = subprocess.Popen(
             ["bash", f"{REPO_PATH}/auto-update.sh"],
-            capture_output=True,
-            text=True,
-            timeout=300
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True  # 脱离父进程，避免被终止
         )
-        return JSONResponse({
-            "status": "success",
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode
-        })
+        
+        # 等待短暂时间获取初始输出（脚本应该立即返回）
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+            return JSONResponse({
+                "status": "success",
+                "message": "Update task started in background",
+                "stdout": stdout.decode('utf-8', errors='ignore') if stdout else "",
+                "stderr": stderr.decode('utf-8', errors='ignore') if stderr else "",
+                "pid": process.pid
+            })
+        except subprocess.TimeoutExpired:
+            # 如果超时，说明脚本正在后台执行
+            return JSONResponse({
+                "status": "success",
+                "message": "Update task is running in background",
+                "pid": process.pid,
+                "log_file": f"{REPO_PATH}/logs/auto-update.log"
+            })
+            
     except Exception as e:
         logger.error(f"Webhook execution failed: {e}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
