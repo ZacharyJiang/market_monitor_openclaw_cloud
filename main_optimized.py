@@ -1075,6 +1075,10 @@ def compute_stats(kline: List[Dict]) -> Dict:
 
 
 def is_trading_day() -> bool:
+    """
+    判断是否为交易日（周一到周五）。
+    注意：此函数仅用于实时行情判断，K线历史数据采集不受此限制。
+    """
     return datetime.now(BEIJING_TZ).weekday() < 5
 
 
@@ -1250,6 +1254,61 @@ def refresh_spot(force: bool = False) -> None:
                 live_provider = "none"
 
 
+def refresh_all_fees() -> None:
+    """
+    批量采集所有 ETF 的费率数据。
+    独立于 K 线采集，确保费率数据完整。
+    """
+    if not etf_spot:
+        logger.warning("No ETF spot data available, skipping fee refresh")
+        return
+    
+    # 获取全部 ETF，按规模降序排列
+    all_codes = _prioritized_codes(limit=0)
+    if not all_codes:
+        return
+    
+    # 找出费率数据缺失的 ETF
+    missing_fee_codes = [code for code in all_codes if code not in _fee_cache]
+    
+    logger.info("Starting fee refresh: total_etfs=%s, missing_fees=%s", 
+                len(all_codes), len(missing_fee_codes))
+    
+    done = 0
+    failed = 0
+    
+    # 优先采集缺失费率的 ETF
+    for code in missing_fee_codes:
+        try:
+            if _fetch_fee_from_eastmoney(code):
+                done += 1
+            else:
+                failed += 1
+        except Exception as exc:
+            failed += 1
+            logger.debug("Fee refresh failed for %s: %s", code, exc)
+    
+    # 再随机采集一部分已有费率的 ETF 进行更新（避免数据过期）
+    existing_fee_codes = [code for code in all_codes if code in _fee_cache]
+    import random
+    sample_size = min(50, len(existing_fee_codes))  # 每天更新50个已有费率的 ETF
+    sample_codes = random.sample(existing_fee_codes, sample_size) if existing_fee_codes else []
+    
+    for code in sample_codes:
+        try:
+            if _fetch_fee_from_eastmoney(code):
+                done += 1
+        except Exception as exc:
+            logger.debug("Fee refresh (update) failed for %s: %s", code, exc)
+    
+    logger.info(
+        "Fee refresh done: updated=%s failed=%s total_missing=%s",
+        done,
+        failed,
+        len(missing_fee_codes),
+    )
+
+
 def refresh_kline_batch(force: bool = False) -> None:
     """
     批量刷新 K 线数据。
@@ -1261,8 +1320,10 @@ def refresh_kline_batch(force: bool = False) -> None:
     if not etf_spot:
         return
 
-    if not is_trading_day() and not FORCE_REFRESH:
-        logger.debug("Skip kline refresh (non-trading day)")
+    # K线历史数据采集不受交易日限制，确保周末也能正常采集
+    # 只在非强制模式下且非交易日时才跳过（定时任务使用非强制模式）
+    if not force and not is_trading_day() and not FORCE_REFRESH:
+        logger.debug("Skip kline refresh (non-trading day and not forced)")
         return
 
     # 获取全部 ETF，按规模降序排列
@@ -1370,11 +1431,24 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    # 添加独立的费率采集任务，每天执行一次
+    scheduler.add_job(
+        refresh_all_fees,
+        "cron",
+        hour=3,  # 每天凌晨3点执行
+        minute=0,
+        id="fee_refresh",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
 
     # Warm up kline for all ETFs in background once (force=True to ensure all ETFs are fetched).
     # Use a lambda to pass force=True parameter.
     threading.Thread(target=lambda: refresh_kline_batch(force=True), daemon=True).start()
+    
+    # 启动时也在后台采集缺失的费率数据
+    threading.Thread(target=refresh_all_fees, daemon=True).start()
 
     # Back-fill stats from any existing kline files that lack the new fields
     # (e.g. after a server upgrade where compute_stats gained new columns).
