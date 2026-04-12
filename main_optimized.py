@@ -997,7 +997,7 @@ async def fetch_premium_for_spot_async(spot: Dict[str, Dict]) -> Dict[str, Dict]
     batch_size = 100
     for i in range(0, len(codes), batch_size):
         batch = codes[i:i+batch_size]
-        premiums = _fetch_premium_batch_sync_async(batch)
+        premiums = _fetch_premium_batch_sync(batch)
         
         # 更新spot数据
         for code, premium in premiums.items():
@@ -1182,54 +1182,47 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
     return None
 
 
-def _fetch_premium_batch_sync_async(codes: List[str]) -> Dict[str, float]:
+def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     """
-    异步批量获取ETF溢价率数据。
-    使用多并发请求，不阻塞主线程。
+    同步批量获取ETF溢价率数据。
+    使用批量API请求，兼容后台线程环境。
     """
     results: Dict[str, float] = {}
     if not codes:
         return results
     
-    client = _get_async_client()
-    semaphore = asyncio.Semaphore(10)  # 限制并发数为10
-    
-    async def fetch_one(code: str) -> Tuple[str, Optional[float]]:
-        async with semaphore:
-            for secid in _secid_candidates(code):
-                try:
-                    url = "https://push2.eastmoney.com/api/qt/stock/get"
-                    params = {
-                        "secid": secid,
-                        "fields": "f184",
-                        "_": int(time.time() * 1000),
-                    }
-                    resp = await client.get(url, params=params)
-                    if resp.status_code != 200:
-                        continue
-                    data = resp.json()
-                    if data and data.get("data"):
-                        premium = data["data"].get("f184")
-                        if premium is not None:
-                            val = _safe_float(premium)
-                            return code, val
-                except Exception:
-                    continue
-                await asyncio.sleep(0.05)  # 短暂延迟避免触发限流
-        return code, None
-    
-    # 并发执行所有请求
-    tasks = [fetch_one(code) for code in codes]
-    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    for result in batch_results:
-        if isinstance(result, Exception):
-            continue
-        code, premium = result
-        if premium is not None:
-            results[code] = premium
-            with _lock:
-                _premium_cache[code] = premium
+    # 使用同步requests批量获取
+    for i in range(0, len(codes), 200):  # 每批200只
+        batch = codes[i:i+200]
+        try:
+            codes_str = ",".join([f"0.{c}" if c.startswith('1') or c.startswith('5') else f"1.{c}" for c in batch])
+            url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+            params = {
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": 2,
+                "invt": 2,
+                "fields": "f12,f20",
+                "secids": codes_str,
+                "_": int(time.time() * 1000)
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('data'):
+                    for item in data['data']:
+                        code = item.get('f12')
+                        premium = item.get('f20')
+                        if code and premium is not None:
+                            try:
+                                val = float(premium)
+                                results[code] = val
+                                with _lock:
+                                    _premium_cache[code] = val
+                            except:
+                                pass
+        except Exception as e:
+            print(f"[WARNING] Premium batch fetch failed: {e}")
+        time.sleep(0.5)  # 批次间延迟避免限流
     
     if results:
         _save_premium_cache()
