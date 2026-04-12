@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ETF 采集进度通知
-每完成一只ETF采集，发送飞书通知给用户
+支持批量进度通知和完成通知
 """
 
 import json
@@ -9,15 +9,28 @@ import os
 import sys
 import math
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 
+BEIJING_TZ = timezone(timedelta(hours=8))
 DATA_DIR = Path(__file__).parent / "data"
 KLINE_DIR = DATA_DIR / "kline"
+
 
 def get_progress():
     """获取当前采集进度"""
     # 已采集的K线文件数量
-    kline_files = list(KLINE_DIR.glob("*.json"))
-    collected = len(kline_files)
+    kline_files = list(KLINE_DIR.glob("*.json")) if KLINE_DIR.exists() else []
+    kline_collected = len(kline_files)
+    
+    # 已采集的费率数据数量
+    fee_collected = 0
+    fee_file = DATA_DIR / "fee_cache.json"
+    if fee_file.exists():
+        try:
+            fee_data = json.load(open(fee_file, encoding="utf-8"))
+            fee_collected = len(fee_data)
+        except Exception as e:
+            print(f"Warning: read fee_cache failed: {e}")
     
     # 读取spot_cache获取总ETF数量
     total = 0
@@ -31,47 +44,82 @@ def get_progress():
             print(f"Warning: read spot_cache failed: {e}")
     
     if total == 0:
-        total = 1422  # 实际已确认大约1422只
-    
-    remaining = total - collected
-    percent = (collected / total * 100) if total > 0 else 0
+        total = max(kline_collected, fee_collected, 1500)  # 默认大约1500只
     
     return {
-        "collected": collected,
-        "total": total,
-        "remaining": remaining,
-        "percent": round(percent, 2)
+        "kline": {
+            "collected": kline_collected,
+            "total": total,
+            "remaining": total - kline_collected,
+            "percent": round((kline_collected / total * 100), 2) if total > 0 else 0
+        },
+        "fee": {
+            "collected": fee_collected,
+            "total": total,
+            "remaining": total - fee_collected,
+            "percent": round((fee_collected / total * 100), 2) if total > 0 else 0
+        }
     }
 
-def generate_message(code, name=None):
-    """生成通知消息"""
-    prog = get_progress()
-    name_str = f"({name})" if name else ""
+
+def generate_batch_message(kline_progress, fee_progress, eta_kline="", eta_fee=""):
+    """生成批量进度通知消息"""
+    msg = "📊 ETF数据采集进度更新\n\n"
     
-    msg = f"✅ 已完成ETF采集: {code} {name_str}\n\n"
-    msg += f"📊 当前进度: {prog['collected']} / {prog['total']} ({prog['percent']}%)\n"
-    msg += f"⏳ 剩余: {prog['remaining']} 只\n"
+    # K线进度
+    msg += f"📈 K线数据\n"
+    msg += f"   进度: {kline_progress['collected']} / {kline_progress['total']} ({kline_progress['percent']}%)\n"
+    msg += f"   剩余: {kline_progress['remaining']} 只\n"
+    if eta_kline:
+        msg += f"   预计: {eta_kline}\n"
     
-    # 预计剩余时间 (按每天16只计算)
-    if prog['remaining'] > 0:
-        days_remaining = math.ceil(prog['remaining'] / 16)
-        msg += f"⌛ 预计还需要: {days_remaining} 天\n"
+    msg += "\n"
+    
+    # 费率进度
+    msg += f"💰 费率数据\n"
+    msg += f"   进度: {fee_progress['collected']} / {fee_progress['total']} ({fee_progress['percent']}%)\n"
+    msg += f"   剩余: {fee_progress['remaining']} 只\n"
+    if eta_fee:
+        msg += f"   预计: {eta_fee}\n"
     
     return msg
 
-def send_notification(message):
+
+def generate_completion_message(kline_progress, fee_progress, total_time=""):
+    """生成完成通知消息"""
+    msg = "🎉 ETF数据采集完成！\n\n"
+    msg += f"📈 K线数据: {kline_progress['collected']} / {kline_progress['total']} ({kline_progress['percent']}%)\n"
+    msg += f"💰 费率数据: {fee_progress['collected']} / {fee_progress['total']} ({fee_progress['percent']}%)\n"
+    if total_time:
+        msg += f"⏱️ 总耗时: {total_time}\n"
+    msg += "\n✅ 所有数据已就绪！"
+    return msg
+
+
+def send_feishu_notification(message):
     """通过openclaw gateway API发送飞书通知"""
     import requests
     
     # 读取OPENCLAW_TOKEN
-    if os.path.exists("/root/.openclaw/workspace_coder/ai-newsletter/.env"):
-        with open("/root/.openclaw/workspace_coder/ai-newsletter/.env") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    key, value = line.split("=", 1)
-                    if key.strip() == "OPENCLAW_TOKEN":
-                        os.environ[key.strip()] = value.strip()
+    token_paths = [
+        "/root/.openclaw/workspace_coder/ai-newsletter/.env",
+        "/opt/market_monitor_openclaw_cloud/.env",
+        str(Path(__file__).parent / ".env")
+    ]
+    
+    for token_path in token_paths:
+        if os.path.exists(token_path):
+            try:
+                with open(token_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            key, value = line.split("=", 1)
+                            if key.strip() == "OPENCLAW_TOKEN":
+                                os.environ[key.strip()] = value.strip()
+                                break
+            except Exception:
+                continue
     
     token = os.environ.get("OPENCLAW_TOKEN")
     if not token:
@@ -98,14 +146,39 @@ def send_notification(message):
         print(f"Failed to send notification: {e}")
         return False
 
-if __name__ == "__main__":
+
+def main():
     if len(sys.argv) < 2:
         print("Usage: python progress-notify.py <code> [name]")
+        print("   or: python progress-notify.py --batch-message '<message>'")
         sys.exit(1)
     
+    # 批量消息模式
+    if sys.argv[1] == "--batch-message":
+        if len(sys.argv) >= 3:
+            message = sys.argv[2]
+        else:
+            # 生成当前进度消息
+            prog = get_progress()
+            message = generate_batch_message(prog["kline"], prog["fee"])
+        print(message)
+        send_feishu_notification(message)
+        return
+    
+    # 单只ETF通知模式（已弃用，保留兼容）
     code = sys.argv[1]
     name = sys.argv[2] if len(sys.argv) >= 3 else None
     
-    msg = generate_message(code, name)
+    prog = get_progress()
+    name_str = f"({name})" if name else ""
+    
+    msg = f"✅ 已完成ETF采集: {code} {name_str}\n\n"
+    msg += f"📈 K线进度: {prog['kline']['collected']} / {prog['kline']['total']} ({prog['kline']['percent']}%)\n"
+    msg += f"💰 费率进度: {prog['fee']['collected']} / {prog['fee']['total']} ({prog['fee']['percent']}%)\n"
+    
     print(msg)
-    send_notification(msg)
+    send_feishu_notification(msg)
+
+
+if __name__ == "__main__":
+    main()
