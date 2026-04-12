@@ -1090,7 +1090,17 @@ def _should_refresh_spot(force: bool = False) -> bool:
     return force or FORCE_REFRESH or is_trading_time()
 
 
-def _should_update_kline(code: str) -> bool:
+def _should_update_kline(code: str, force: bool = False) -> bool:
+    """
+    判断是否需要更新 K 线数据。
+    
+    Args:
+        code: ETF 代码
+        force: 如果为 True，强制更新（忽略今天已更新的检查）
+    """
+    if force:
+        return True
+    
     today = _today_bj_str()
     if _last_kline_update.get(code) != today:
         return True
@@ -1240,10 +1250,13 @@ def refresh_spot(force: bool = False) -> None:
                 live_provider = "none"
 
 
-def refresh_kline_batch() -> None:
+def refresh_kline_batch(force: bool = False) -> None:
     """
     批量刷新 K 线数据。
     采集全部 ETF（按规模降序），KLINE_TOP_N 控制每批处理数量。
+    
+    Args:
+        force: 如果为 True，强制更新所有 ETF（忽略今天已更新的检查）
     """
     if not etf_spot:
         return
@@ -1267,14 +1280,14 @@ def refresh_kline_batch() -> None:
     target_count = len(all_codes) if KLINE_TOP_N <= 0 else min(KLINE_TOP_N, len(all_codes))
     codes_to_process = all_codes[:target_count]
 
-    logger.info("Starting kline refresh: total=%s, target=%s, batch_size=%s", 
-                len(all_codes), target_count, KLINE_BATCH_SIZE)
+    logger.info("Starting kline refresh: total=%s, target=%s, batch_size=%s, force=%s", 
+                len(all_codes), target_count, KLINE_BATCH_SIZE, force)
 
     for start in range(0, len(codes_to_process), KLINE_BATCH_SIZE):
         batch = codes_to_process[start : start + KLINE_BATCH_SIZE]
 
         for code in batch:
-            if not _should_update_kline(code):
+            if not _should_update_kline(code, force=force):
                 skipped += 1
                 continue
 
@@ -1359,8 +1372,9 @@ async def lifespan(app: FastAPI):
     )
     scheduler.start()
 
-    # Warm up kline for top ETFs in background once.
-    threading.Thread(target=refresh_kline_batch, daemon=True).start()
+    # Warm up kline for all ETFs in background once (force=True to ensure all ETFs are fetched).
+    # Use a lambda to pass force=True parameter.
+    threading.Thread(target=lambda: refresh_kline_batch(force=True), daemon=True).start()
 
     # Back-fill stats from any existing kline files that lack the new fields
     # (e.g. after a server upgrade where compute_stats gained new columns).

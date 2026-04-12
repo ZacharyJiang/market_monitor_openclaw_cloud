@@ -119,7 +119,19 @@ body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;backgr
     </div>
     <!-- PAGINATION -->
     <div id="pagination" class="flex items-center justify-between px-4 py-3 border-t border-cyan-900/10">
-      <span class="text-xs text-gray-500 font-mono" id="pageInfo"></span>
+      <div class="flex items-center gap-3">
+        <span class="text-xs text-gray-500 font-mono" id="pageInfo"></span>
+        <div class="flex items-center gap-2">
+          <label class="text-[10px] text-gray-500 font-mono uppercase">每页</label>
+          <select id="pageSizeSelect" class="filter-input py-1 px-2 text-xs" style="width:auto;min-width:60px;">
+            <option value="50" selected>50</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+          </select>
+          <span class="text-[10px] text-gray-500 font-mono">条</span>
+        </div>
+      </div>
       <div class="flex items-center gap-1" id="pageButtons"></div>
     </div>
   </section>
@@ -146,8 +158,7 @@ body::after{content:'';position:fixed;top:0;left:0;width:100%;height:100%;backgr
 // ============================================================
 let ETF_DATA = [];
 let dataSource = 'loading';
-const state = { sortKey:'scale', sortDir:'desc', search:'', filters:{}, modalETF:null, modalRange:'1Y', page:1 };
-const PAGE_SIZE = 50;
+const state = { sortKey:'scale', sortDir:'desc', search:'', filters:{}, modalETF:null, modalRange:'1Y', page:1, pageSize:50 };
 const COLUMNS = [
   {key:'name',label:'ETF名称',sortable:true,filterable:false},
   {key:'code',label:'代码',sortable:true,filterable:false},
@@ -296,11 +307,11 @@ let sparkCharts={};
 function renderTable() {
   Object.values(sparkCharts).forEach(c=>c.dispose()); sparkCharts={};
   const allData = getFilteredSorted();
-  const totalPages = Math.max(1, Math.ceil(allData.length / PAGE_SIZE));
+  const totalPages = Math.max(1, Math.ceil(allData.length / state.pageSize));
   if (state.page > totalPages) state.page = totalPages;
   if (state.page < 1) state.page = 1;
-  const start = (state.page - 1) * PAGE_SIZE;
-  const data = allData.slice(start, start + PAGE_SIZE);
+  const start = (state.page - 1) * state.pageSize;
+  const data = allData.slice(start, start + state.pageSize);
   document.getElementById('statsInfo').textContent=`${allData.length} / ${ETF_DATA.length} 支ETF`;
   const tbody = document.getElementById('tableBody');
   tbody.innerHTML = data.map((etf,i)=>{
@@ -474,6 +485,13 @@ document.getElementById('closeModal').addEventListener('click',closeModalFn);
 document.getElementById('klineModal').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModalFn();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape')closeModalFn();});
 window.addEventListener('resize',()=>{Object.values(sparkCharts).forEach(c=>c.resize());});
+
+// Page size selector
+document.getElementById('pageSizeSelect').addEventListener('change',e=>{
+  state.pageSize=parseInt(e.target.value);
+  state.page=1;
+  renderTable();
+});
 
 renderFilterPanel();
 fetchData();
