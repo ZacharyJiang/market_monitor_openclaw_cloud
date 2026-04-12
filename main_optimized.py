@@ -1513,7 +1513,7 @@ def _fetch_etf_name_from_eastmoney(code: str) -> Optional[str]:
 
 def _fetch_all_exchange_funds() -> Dict[str, str]:
     """
-    从东方财富获取所有场内基金（包括ETF、LOF、QDII等）。
+    从东方财富获取所有场内基金（包括ETF、LOF、QDII、商品ETF、跨境ETF等）。
     返回 {code: name} 字典。
     """
     funds = {}
@@ -1523,19 +1523,20 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         params = {
             "pn": 1,
-            "pz": 5000,  # 获取5000只，应该覆盖所有
+            "pz": 10000,  # 获取10000只，覆盖所有
             "po": 1,
             "np": 1,
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 必须和spot接口用同一个ut参数
             "fltt": 2,
             "invt": 2,
             "fid": "f12",  # 按代码排序
-            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13",  # 场内基金
+            # 全类型场内基金: ETF(10)/LOF(11)/QDII(12)/分级(13)/商品(14)/REITs(15)
+            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15",
             "fields": "f12,f14",  # f12=代码, f14=名称
             "_": int(time.time() * 1000)
         }
-        
-        payload = _request_json(url, params, retries=2)
+
+        payload = _request_json(url, params, retries=3)
         if not payload:
             logger.warning("⚠️ Empty response from fund list API")
             return funds
@@ -1557,8 +1558,12 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
             name = item.get("f14", "").strip()
             if code and name and len(code) == 6:
                 funds[code] = name
-                    
+        
         logger.info(f"✅ Successfully fetched {len(funds)} exchange funds from Eastmoney")
+        # 打印特殊基金验证
+        special = {k:v for k,v in funds.items() if '原油' in v or '印度' in v or '商品' in v or '油气' in v}
+        if special:
+            logger.info(f"📋 包含特殊基金: {list(special.items())[:10]}")
     except Exception as e:
         logger.error(f"❌ Failed to fetch exchange funds: {e}", exc_info=True)
     
