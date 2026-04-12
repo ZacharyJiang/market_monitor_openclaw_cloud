@@ -13,6 +13,7 @@ import os
 import random
 import time
 import threading
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ import hashlib
 import subprocess
 
 import requests
+import httpx  # 添加异步HTTP客户端
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -247,6 +249,24 @@ if _PROXY:
     logger.info("Using proxy for market requests")
 else:
     logger.info("No proxy configured — direct market requests")
+
+# 异步HTTP客户端（用于批量溢价数据获取，不阻塞主线程）
+_async_client: Optional[httpx.AsyncClient] = None
+
+def _get_async_client() -> httpx.AsyncClient:
+    global _async_client
+    if _async_client is None:
+        _async_client = httpx.AsyncClient(
+            headers={
+                "User-Agent": SESSION.headers.get("User-Agent", ""),
+                "Accept": "application/json,text/plain,*/*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Referer": "https://quote.eastmoney.com/",
+            },
+            timeout=10.0,
+            proxies={"all://": _PROXY} if _PROXY else None,
+        )
+    return _async_client
 
 
 # ============================================================
@@ -941,14 +961,6 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
             spot = _fetch_spot_from_endpoint(endpoint)
             if spot:
                 logger.info("Spot fetched from %s, count=%s", endpoint, len(spot))
-                # 为每个 ETF 获取溢价数据
-                for code in spot:
-                    try:
-                        premium = _fetch_premium_from_eastmoney(code)
-                        if premium is not None:
-                            spot[code]["premium"] = premium
-                    except Exception as e:
-                        logger.debug(f"Failed to fetch premium for {code}: {e}")
                 return "eastmoney", spot
         except Exception as exc:
             last_err = exc
@@ -959,14 +971,6 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
         spot = _fetch_spot_from_sina(scale_hints)
         if spot:
             logger.info("Spot fetched from Sina, count=%s", len(spot))
-            # Sina 数据不包含溢价，尝试从 Eastmoney 获取
-            for code in spot:
-                try:
-                    premium = _fetch_premium_from_eastmoney(code)
-                    if premium is not None:
-                        spot[code]["premium"] = premium
-                except Exception as e:
-                    logger.debug(f"Failed to fetch premium for {code}: {e}")
             return "sina", spot
     except Exception as exc:
         last_err = exc
@@ -975,6 +979,40 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
     if last_err:
         raise last_err
     return "none", {}
+
+
+async def fetch_premium_for_spot_async(spot: Dict[str, Dict]) -> Dict[str, Dict]:
+    """
+    异步批量获取spot中所有ETF的溢价数据。
+    不阻塞主线程，使用并发请求。
+    """
+    codes = list(spot.keys())
+    if not codes:
+        return spot
+    
+    logger.info("Fetching premium data for %s ETFs asynchronously...", len(codes))
+    start_time = time.time()
+    
+    # 分批处理，每批100个
+    batch_size = 100
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i+batch_size]
+        premiums = await _fetch_premium_batch_async(batch)
+        
+        # 更新spot数据
+        for code, premium in premiums.items():
+            if code in spot:
+                spot[code]["premium"] = premium
+        
+        logger.info("Premium batch %s/%s completed, got %s premiums", 
+                   i//batch_size + 1, (len(codes)-1)//batch_size + 1, len(premiums))
+        
+        # 短暂延迟，给事件循环喘息机会
+        await asyncio.sleep(0.1)
+    
+    elapsed = time.time() - start_time
+    logger.info("Premium fetch completed in %.2fs", elapsed)
+    return spot
 
 
 def fetch_indices_live() -> Tuple[str, List[Dict]]:
@@ -1142,6 +1180,61 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
             logger.debug("Fetch premium failed for %s: %s", code, exc)
     
     return None
+
+
+async def _fetch_premium_batch_async(codes: List[str]) -> Dict[str, float]:
+    """
+    异步批量获取ETF溢价率数据。
+    使用多并发请求，不阻塞主线程。
+    """
+    results: Dict[str, float] = {}
+    if not codes:
+        return results
+    
+    client = _get_async_client()
+    semaphore = asyncio.Semaphore(10)  # 限制并发数为10
+    
+    async def fetch_one(code: str) -> Tuple[str, Optional[float]]:
+        async with semaphore:
+            for secid in _secid_candidates(code):
+                try:
+                    url = "https://push2.eastmoney.com/api/qt/stock/get"
+                    params = {
+                        "secid": secid,
+                        "fields": "f184",
+                        "_": int(time.time() * 1000),
+                    }
+                    resp = await client.get(url, params=params)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                    if data and data.get("data"):
+                        premium = data["data"].get("f184")
+                        if premium is not None:
+                            val = _safe_float(premium)
+                            return code, val
+                except Exception:
+                    continue
+                await asyncio.sleep(0.05)  # 短暂延迟避免触发限流
+        return code, None
+    
+    # 并发执行所有请求
+    tasks = [fetch_one(code) for code in codes]
+    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for result in batch_results:
+        if isinstance(result, Exception):
+            continue
+        code, premium = result
+        if premium is not None:
+            results[code] = premium
+            with _lock:
+                _premium_cache[code] = premium
+    
+    if results:
+        _save_premium_cache()
+    
+    return results
 
 
 def _fetch_fee_from_eastmoney(code: str) -> bool:
@@ -1608,6 +1701,19 @@ def refresh_spot(force: bool = False) -> None:
         if not new_spot:
             raise RuntimeError("empty spot data")
 
+        # 异步获取溢价数据（不阻塞主线程）
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 如果在运行中的事件循环中，使用create_task
+                asyncio.create_task(fetch_premium_for_spot_async(new_spot))
+                logger.info("Premium fetch scheduled as background task")
+            else:
+                # 否则直接运行
+                new_spot = loop.run_until_complete(fetch_premium_for_spot_async(new_spot))
+        except RuntimeError as e:
+            logger.warning("Async premium fetch skipped: %s", e)
+
         index_provider, new_indices = fetch_indices_live()
 
         with _lock:
@@ -1784,13 +1890,18 @@ scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global data_source, live_provider
+    global data_source, live_provider, _async_client
 
     _load_fee_cache()
     cache_loaded = load_spot_cache()
 
     # Startup: always try one live refresh first.
-    refresh_spot(force=True)
+    # 在后台线程中执行，避免阻塞启动
+    def startup_refresh():
+        time.sleep(2)  # 等待服务完全启动
+        refresh_spot(force=True)
+    
+    threading.Thread(target=startup_refresh, daemon=True).start()
 
     with _lock:
         if not etf_spot:
@@ -1810,8 +1921,13 @@ async def lifespan(app: FastAPI):
     )
 
     # 确保所有场内基金都在列表中（包括ETF、LOF、QDII等）
-    _ensure_all_etfs_in_spot()
-    logger.info("After ETF discovery: total etfs=%s", len(etf_spot))
+    # 使用延迟执行，避免启动时阻塞
+    def delayed_discovery():
+        time.sleep(5)
+        _ensure_all_etfs_in_spot()
+        logger.info("After ETF discovery: total etfs=%s", len(etf_spot))
+    
+    threading.Thread(target=delayed_discovery, daemon=True).start()
 
     scheduler.add_job(
         refresh_spot,
@@ -1874,6 +1990,12 @@ async def lifespan(app: FastAPI):
 
     yield
     scheduler.shutdown(wait=False)
+    
+    # 关闭异步HTTP客户端
+    global _async_client
+    if _async_client:
+        await _async_client.aclose()
+        _async_client = None
 
 
 app = FastAPI(title="ETF NEXUS", lifespan=lifespan)
