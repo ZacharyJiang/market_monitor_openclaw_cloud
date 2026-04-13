@@ -1264,15 +1264,15 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                         if not code:
                             continue
                         try:
-                            # 优先通过最新价和净值计算真实溢价率，最准确
+                            # 优先使用东方财富直接返回的f184溢价率，最准确，不需要计算
                             premium = None
-                            if price > 0 and nav > 0:
-                                premium = round(((price - nav) / nav) * 100, 2)
-                            # 如果计算失败，再尝试用f184字段
-                            elif f184 is not None and abs(f184) < 20:  # 过滤异常值，溢价率超过20%的肯定是错的
+                            if f184 is not None and abs(f184) < 20:  # 过滤异常值，溢价率超过20%的肯定是错的
                                 premium = round(f184, 2)
-                            # 如果有有效溢价率，保存
-                            if premium is not None and abs(premium) < 20:
+                            # 只有当f184不存在的时候，才尝试通过最新价和净值计算
+                            elif price > 0 and nav > 0 and abs(((price - nav) / nav) * 100) < 20:
+                                premium = round(((price - nav) / nav) * 100, 2)
+                            # 非交易时间价格为0的时候，不更新溢价率，保留缓存中的历史有效值
+                            if premium is not None:
                                 results[code] = premium
                                 with _lock:
                                     _premium_cache[code] = premium
