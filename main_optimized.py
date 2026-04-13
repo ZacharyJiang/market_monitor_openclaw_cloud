@@ -1244,7 +1244,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                 "fltt": 2,
                 "invt": 2,
-                "fields": "f12,f184,f2",  # f12=代码, f184=溢价率(%), f2=最新价
+                "fields": "f12,f2,f183,f184",  # f12=代码, f2=最新价, f183=单位净值, f184=溢价率(实际可能不对)
                 "secids": codes_str,
                 "_": int(time.time() * 1000)
             }
@@ -1256,15 +1256,26 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                 if data.get('data') and data['data'].get('diff'):
                     for item in data['data']['diff']:
                         code = item.get('f12')
-                        premium = item.get('f184')
-                        if code and premium is not None:
-                            try:
-                                val = float(premium)
-                                results[code] = val
+                        price = _safe_float(item.get('f2'))
+                        nav = _safe_float(item.get('f183'))
+                        f184 = _safe_float(item.get('f184'))
+                        if not code:
+                            continue
+                        try:
+                            # 优先通过最新价和净值计算真实溢价率，最准确
+                            premium = None
+                            if price > 0 and nav > 0:
+                                premium = round(((price - nav) / nav) * 100, 2)
+                            # 如果计算失败，再尝试用f184字段
+                            elif f184 is not None and abs(f184) < 20:  # 过滤异常值，溢价率超过20%的肯定是错的
+                                premium = round(f184, 2)
+                            # 如果有有效溢价率，保存
+                            if premium is not None and abs(premium) < 20:
+                                results[code] = premium
                                 with _lock:
-                                    _premium_cache[code] = val
-                            except:
-                                pass
+                                    _premium_cache[code] = premium
+                        except Exception as e:
+                            logger.debug(f"溢价计算失败 {code}: {e}")
             logger.info(f"Premium batch {i//200 +1}: fetched {len(results)} valid premiums")
         except Exception as e:
             logger.warning(f"Premium batch fetch failed: {e}")
@@ -1614,8 +1625,8 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
                     code = item.get("f12", "").strip()
                     name = item.get("f14", "").strip()
                     price = item.get("f2", 0.0)
-                    # 过滤无效基金：价格为0的或者名称不正确的
-                    if code and name and len(code) == 6 and price > 0:
+                    # 不过滤价格为0的基金，保留所有合法的场内基金，包括非交易时间没有报价的QDII/LOF
+                    if code and name and len(code) == 6 and not name.startswith(("ETF ", "基金")):
                         funds[code] = name
                         valid_page_count += 1
                 
@@ -1662,6 +1673,14 @@ def _ensure_all_etfs_in_spot() -> None:
         
         # 1. 从东方财富获取所有场内基金（最全面的数据源）
         exchange_funds = _fetch_all_exchange_funds()
+        # 先保存原有spot里的有效数据，避免覆盖
+        existing_etf_data = etf_spot.copy()
+        # 清空spot，然后合并原有数据和新发现的基金
+        etf_spot.clear()
+        # 先添加原有基金数据
+        for code, data in existing_etf_data.items():
+            etf_spot[code] = data
+        # 再添加新发现的基金，只加原来没有的
         for code, name in exchange_funds.items():
             if code not in etf_spot and len(code) == 6:
                 etf_spot[code] = {
