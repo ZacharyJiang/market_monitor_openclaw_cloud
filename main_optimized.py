@@ -995,24 +995,59 @@ async def fetch_premium_for_spot_async(spot: Dict[str, Dict]) -> Dict[str, Dict]
     
     # 分批处理，每批100个
     batch_size = 100
+    total_success = 0
     for i in range(0, len(codes), batch_size):
         batch = codes[i:i+batch_size]
-        premiums = _fetch_premium_batch_sync(batch)
+        try:
+            premiums = _fetch_premium_batch_sync(batch)
+            success_count = len(premiums)
+            total_success += success_count
+            
+            # 更新spot数据
+            for code, premium in premiums.items():
+                if code in spot:
+                    spot[code]["premium"] = premium
+            
+            logger.info("Premium batch %s/%s completed: got %s/%s premiums", 
+                       i//batch_size + 1, (len(codes)-1)//batch_size + 1, success_count, len(batch))
+        except Exception as e:
+            logger.warning(f"Premium batch {i//batch_size +1} failed: {e}")
         
-        # 更新spot数据
-        for code, premium in premiums.items():
-            if code in spot:
-                spot[code]["premium"] = premium
-        
-        logger.info("Premium batch %s/%s completed, got %s premiums", 
-                   i//batch_size + 1, (len(codes)-1)//batch_size + 1, len(premiums))
-        
-        # 短暂延迟，给事件循环喘息机会
-        await asyncio.sleep(0.1)
+        # 短暂延迟，避免触发限流
+        await asyncio.sleep(0.3)
     
     elapsed = time.time() - start_time
-    logger.info("Premium fetch completed in %.2fs", elapsed)
+    logger.info("Premium fetch completed: success=%s total=%s time=%.2fs", total_success, len(codes), elapsed)
     return spot
+
+# 新增独立的溢价刷新任务，单独运行不依赖spot刷新
+def refresh_all_premium() -> None:
+    """刷新所有ETF的溢价数据，独立定时任务"""
+    if not etf_spot:
+        logger.warning("No ETF spot data available, skipping premium refresh")
+        return
+    
+    all_codes = list(etf_spot.keys())
+    logger.info("Starting full premium refresh for %s ETFs...", len(all_codes))
+    
+    batch_size = 100
+    total_success = 0
+    for i in range(0, len(all_codes), batch_size):
+        batch = all_codes[i:i+batch_size]
+        try:
+            premiums = _fetch_premium_batch_sync(batch)
+            total_success += len(premiums)
+        except Exception as e:
+            logger.warning(f"Premium refresh batch {i//batch_size +1} failed: {e}")
+        time.sleep(0.3)
+    
+    # 更新last_updated时间戳
+    global last_updated
+    with _lock:
+        last_updated = _now_bj_str()
+    save_spot_cache()
+    
+    logger.info("Full premium refresh completed: updated=%s total=%s", total_success, len(all_codes))
 
 
 def fetch_indices_live() -> Tuple[str, List[Dict]]:
@@ -1187,7 +1222,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     同步批量获取ETF溢价率数据。
     使用批量API请求，兼容后台线程环境。
     """
-    results: Dict[str, float] = {}
+    results = {}
     if not codes:
         return results
     
@@ -1195,23 +1230,33 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     for i in range(0, len(codes), 200):  # 每批200只
         batch = codes[i:i+200]
         try:
-            codes_str = ",".join([f"0.{c}" if c.startswith('1') or c.startswith('5') else f"1.{c}" for c in batch])
+            # 修复secid构造错误：5/6/9开头的沪市基金用1.前缀，其他用0.前缀
+            secids = []
+            for c in batch:
+                if len(c) == 6 and c.startswith(("5", "6", "9")):
+                    secids.append(f"1.{c}")
+                else:
+                    secids.append(f"0.{c}")
+            codes_str = ",".join(secids)
+            
             url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
             params = {
                 "ut": "bd1d9ddb04089700cf9c27f6f7426281",
                 "fltt": 2,
                 "invt": 2,
-                "fields": "f12,f20",
+                "fields": "f12,f184,f2",  # f12=代码, f184=溢价率(%), f2=最新价
                 "secids": codes_str,
                 "_": int(time.time() * 1000)
             }
-            resp = requests.get(url, params=params, timeout=10)
+            resp = requests.get(url, params=params, timeout=10, headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+            })
             if resp.status_code == 200:
                 data = resp.json()
-                if data.get('data'):
-                    for item in data['data']:
+                if data.get('data') and data['data'].get('diff'):
+                    for item in data['data']['diff']:
                         code = item.get('f12')
-                        premium = item.get('f20')
+                        premium = item.get('f184')
                         if code and premium is not None:
                             try:
                                 val = float(premium)
@@ -1220,12 +1265,14 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                                     _premium_cache[code] = val
                             except:
                                 pass
+            logger.info(f"Premium batch {i//200 +1}: fetched {len(results)} valid premiums")
         except Exception as e:
-            print(f"[WARNING] Premium batch fetch failed: {e}")
+            logger.warning(f"Premium batch fetch failed: {e}")
         time.sleep(0.5)  # 批次间延迟避免限流
     
     if results:
         _save_premium_cache()
+        logger.info(f"Total premium cache size: {len(_premium_cache)}")
     
     return results
 
@@ -1396,7 +1443,15 @@ def is_trading_time() -> bool:
 
 
 def _should_refresh_spot(force: bool = False) -> bool:
-    return force or FORCE_REFRESH or is_trading_time()
+    # 无论是否交易时间，都可以强制刷新
+    if force or FORCE_REFRESH:
+        return True
+    # 交易时间必须刷新
+    if is_trading_time():
+        return True
+    # 非交易时间每30分钟刷新一次（确保更新时间不会停在15点）
+    now = datetime.now(BEIJING_TZ)
+    return now.minute % 30 == 0  # 每小时的0分和30分刷新一次非交易时间数据
 
 
 def _should_update_kline(code: str, force: bool = False) -> bool:
@@ -1519,51 +1574,76 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
     funds = {}
     try:
         logger.info("📥 Fetching all exchange funds from Eastmoney...")
-        # 获取所有场内基金列表（包括ETF、LOF等）
+        # 获取所有场内基金列表（包括ETF、LOF等），分页获取避免数据截断
         url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pn": 1,
-            "pz": 10000,  # 获取10000只，覆盖所有
+        base_params = {
+            "pz": 1000,  # 每页1000条
             "po": 1,
             "np": 1,
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",  # 必须和spot接口用同一个ut参数
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": 2,
             "invt": 2,
-            "fid": "f12",  # 按代码排序
-            # 全类型场内基金: ETF(10)/LOF(11)/QDII(12)/分级(13)/商品(14)/REITs(15)
-            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15",
-            "fields": "f12,f14",  # f12=代码, f14=名称
-            "_": int(time.time() * 1000)
+            "fid": "f12",
+            # 全类型覆盖：ETF(10)/LOF(11)/QDII(12)/分级(13)/商品(14)/REITs(15)/股票封基(16)
+            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16",
+            "fields": "f12,f14,f2",  # f12=代码, f14=名称, f2=价格（过滤无效基金）
         }
-
-        payload = _request_json(url, params, retries=3)
-        if not payload:
-            logger.warning("⚠️ Empty response from fund list API")
-            return funds
         
-        data = payload.get("data")
-        if not data:
-            logger.warning("⚠️ No data field in fund list response")
-            return funds
+        # 分页获取，最多获取10页（10000只，覆盖所有场内基金）
+        for page in range(1, 11):
+            params = dict(base_params)
+            params["pn"] = page
+            params["_"] = int(time.time() * 1000)
+            
+            try:
+                payload = _request_json(url, params, retries=3)
+                if not payload or not payload.get("data"):
+                    logger.warning(f"⚠️ Page {page} empty, stop fetching")
+                    break
+                
+                data = payload.get("data")
+                diff = data.get("diff")
+                if not diff or not isinstance(diff, list) or len(diff) == 0:
+                    logger.warning(f"⚠️ Page {page} has no data, stop fetching")
+                    break
+                
+                valid_page_count = 0
+                for item in diff:
+                    if not isinstance(item, dict):
+                        continue
+                    code = item.get("f12", "").strip()
+                    name = item.get("f14", "").strip()
+                    price = item.get("f2", 0.0)
+                    # 过滤无效基金：价格为0的或者名称不正确的
+                    if code and name and len(code) == 6 and price > 0:
+                        funds[code] = name
+                        valid_page_count += 1
+                
+                logger.info(f"✅ Page {page} fetched: {valid_page_count} valid funds, total now: {len(funds)}")
+                # 如果当前页返回数量小于每页最大数量，说明已经到最后一页
+                if len(diff) < params["pz"]:
+                    break
+                    
+                time.sleep(0.5)  # 分页请求间隔
+            except Exception as e:
+                logger.warning(f"⚠️ Page {page} fetch failed: {e}")
+                break
         
-        diff = data.get("diff")
-        if not diff or not isinstance(diff, list):
-            logger.warning("⚠️ No diff list in fund list response")
-            return funds
-        
-        for item in diff:
-            if not isinstance(item, dict):
-                continue
-            code = item.get("f12", "").strip()
-            name = item.get("f14", "").strip()
-            if code and name and len(code) == 6:
-                funds[code] = name
-        
-        logger.info(f"✅ Successfully fetched {len(funds)} exchange funds from Eastmoney")
-        # 打印特殊基金验证
-        special = {k:v for k,v in funds.items() if '原油' in v or '印度' in v or '商品' in v or '油气' in v}
-        if special:
-            logger.info(f"📋 包含特殊基金: {list(special.items())[:10]}")
+        logger.info(f"✅ Successfully fetched {len(funds)} valid exchange funds from Eastmoney")
+        # 验证特殊基金是否存在
+        special_codes = ['164824', '501018', '160416', '162411', '513030', '513500']
+        found_special = {k:v for k,v in funds.items() if k in special_codes}
+        if found_special:
+            logger.info(f"📋 特殊基金已包含: {list(found_special.items())}")
+        else:
+            logger.warning(f"⚠️ 未找到特殊基金: {special_codes}，将单独尝试获取")
+            # 单独获取缺失的特殊基金
+            for code in special_codes:
+                if code not in funds:
+                    name = _fetch_etf_name_from_eastmoney(code)
+                    if name:
+                        funds[code] = name
+                        logger.info(f"✅ 单独获取到特殊基金 {code}: {name}")
     except Exception as e:
         logger.error(f"❌ Failed to fetch exchange funds: {e}", exc_info=True)
     
@@ -1970,6 +2050,25 @@ async def lifespan(app: FastAPI):
         hour=15,
         minute=0,
         id="save_afternoon_close_premium",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 添加独立溢价刷新任务，每5分钟运行一次
+    scheduler.add_job(
+        refresh_all_premium,
+        "interval",
+        minutes=5,
+        id="premium_refresh",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 添加每日基金发现任务，每天凌晨2点执行，发现新增ETF/LOF
+    scheduler.add_job(
+        _ensure_all_etfs_in_spot,
+        "cron",
+        hour=2,
+        minute=0,
+        id="etf_discovery",
         max_instances=1,
         coalesce=True,
     )
