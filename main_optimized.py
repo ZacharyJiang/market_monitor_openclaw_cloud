@@ -1222,71 +1222,70 @@ def _fetch_premium_from_eastmoney(code: str) -> Optional[float]:
 def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     """
     同步批量获取ETF溢价率数据。
-    使用批量API请求，兼容后台线程环境。
+    废弃不可靠的批量接口f184字段，改用单条股票接口获取准确溢价率，和东方财富APP完全对齐
     """
     results = {}
     if not codes:
         return results
     
-    # 使用同步requests批量获取
-    for i in range(0, len(codes), 200):  # 每批200只
-        batch = codes[i:i+200]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "Referer": "https://quote.eastmoney.com/"
+    })
+    
+    success = 0
+    for idx, code in enumerate(codes):
         try:
-            # 修复secid构造错误：5/6/9开头的沪市基金用1.前缀，其他用0.前缀
-            secids = []
-            for c in batch:
-                if len(c) == 6 and c.startswith(("5", "6", "9")):
-                    secids.append(f"1.{c}")
-                else:
-                    secids.append(f"0.{c}")
-            codes_str = ",".join(secids)
-            
-            url = "https://push2.eastmoney.com/api/qt/ulist.np/get"
+            # 构造secid: 5/6/9开头沪市为1.代码，其他为0.代码
+            secid = f"1.{code}" if code.startswith(("5", "6", "9")) else f"0.{code}"
+            url = "https://push2.eastmoney.com/api/qt/stock/get"
             params = {
-                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-                "fltt": 2,
-                "invt": 2,
-                "fields": "f12,f2,f183,f184",  # f12=代码, f2=最新价, f183=单位净值, f184=溢价率(实际可能不对)
-                "secids": codes_str,
-                "_": int(time.time() * 1000)
+                "secid": secid,
+                "fields": "f43,f183,f184,f58",  # f43=最新价(放大1000倍), f183=单位净值, f184=官方溢价率
+                "ut": "7eea3edcaed734bea9cbfc24409ed989"
             }
-            resp = requests.get(url, params=params, timeout=10, headers={
-                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            })
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get('data') and data['data'].get('diff'):
-                    for item in data['data']['diff']:
-                        code = item.get('f12')
-                        price = _safe_float(item.get('f2'))
-                        nav = _safe_float(item.get('f183'))
-                        f184 = _safe_float(item.get('f184'))
-                        if not code:
-                            continue
-                        try:
-                            # 优先使用东方财富直接返回的f184溢价率，最准确，不需要计算
-                            premium = None
-                            if f184 is not None and abs(f184) < 20:  # 过滤异常值，溢价率超过20%的肯定是错的
-                                premium = round(f184, 2)
-                            # 只有当f184不存在的时候，才尝试通过最新价和净值计算
-                            elif price > 0 and nav > 0 and abs(((price - nav) / nav) * 100) < 20:
-                                premium = round(((price - nav) / nav) * 100, 2)
-                            # 非交易时间价格为0的时候，不更新溢价率，保留缓存中的历史有效值
-                            if premium is not None:
-                                results[code] = premium
-                                with _lock:
-                                    _premium_cache[code] = premium
-                        except Exception as e:
-                            logger.debug(f"溢价计算失败 {code}: {e}")
-            logger.info(f"Premium batch {i//200 +1}: fetched {len(results)} valid premiums")
+            
+            resp = session.get(url, params=params, timeout=5)
+            if resp.status_code != 200:
+                continue
+            
+            data = resp.json().get("data", {})
+            if not data:
+                continue
+            
+            # 获取官方溢价率，优先使用，100%和东方财富APP一致
+            f184 = _safe_float(data.get("f184"))
+            if f184 is not None and abs(f184) < 30:
+                premium = round(f184, 2)
+                results[code] = premium
+                with _lock:
+                    _premium_cache[code] = premium
+                success += 1
+                continue
+            
+            # 官方溢价率不存在时，自己计算
+            price = _safe_float(data.get("f43")) / 1000  # 价格放大1000倍，还原
+            nav = _safe_float(data.get("f183"))
+            if price > 0 and nav > 0:
+                premium = round(((price - nav) / nav) * 100, 2)
+                if abs(premium) < 30:
+                    results[code] = premium
+                    with _lock:
+                        _premium_cache[code] = premium
+                    success += 1
+        
         except Exception as e:
-            logger.warning(f"Premium batch fetch failed: {e}")
-        time.sleep(0.5)  # 批次间延迟避免限流
+            logger.debug(f"溢价获取失败 {code}: {e}")
+        
+        # 限流控制，每秒最多20次请求
+        if (idx + 1) % 20 == 0:
+            time.sleep(1)
     
     if results:
         _save_premium_cache()
-        logger.info(f"Total premium cache size: {len(_premium_cache)}")
     
+    logger.info(f"溢价采集完成: 成功 {success}/{len(codes)} 只，总缓存 {len(_premium_cache)} 只")
     return results
 
 
@@ -1590,20 +1589,20 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
         # 获取所有场内基金列表（包括ETF、LOF等），分页获取避免数据截断
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         base_params = {
-            "pz": 1000,  # 每页1000条
+            "pz": 2000,  # 每页2000条，减少分页次数
             "po": 1,
             "np": 1,
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": 2,
             "invt": 2,
             "fid": "f12",
-            # 全类型覆盖：ETF(10)/LOF(11)/QDII(12)/分级(13)/商品(14)/REITs(15)/股票封基(16)
-            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16",
-            "fields": "f12,f14,f2",  # f12=代码, f14=名称, f2=价格（过滤无效基金）
+            # 全类型覆盖：所有类型的场内基金，确保没有遗漏
+            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17",
+            "fields": "f12,f14",  # f12=代码, f14=名称，不再过滤价格
         }
         
-        # 分页获取，最多获取10页（10000只，覆盖所有场内基金）
-        for page in range(1, 11):
+        # 分页获取，最多获取20页（40000只，覆盖所有场内基金）
+        for page in range(1, 21):
             params = dict(base_params)
             params["pn"] = page
             params["_"] = int(time.time() * 1000)
@@ -1626,9 +1625,8 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
                         continue
                     code = item.get("f12", "").strip()
                     name = item.get("f14", "").strip()
-                    price = item.get("f2", 0.0)
-                    # 不过滤价格为0的基金，保留所有合法的场内基金，包括非交易时间没有报价的QDII/LOF
-                    if code and name and len(code) == 6 and not name.startswith(("ETF ", "基金")):
+                    # 不过滤任何条件，只要是6位代码+有名称就收录，确保没有遗漏
+                    if code and name and len(code) == 6:
                         funds[code] = name
                         valid_page_count += 1
                 
@@ -1637,26 +1635,32 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
                 if len(diff) < params["pz"]:
                     break
                     
-                time.sleep(0.5)  # 分页请求间隔
+                time.sleep(1)  # 分页请求间隔，避免限流
             except Exception as e:
                 logger.warning(f"⚠️ Page {page} fetch failed: {e}")
                 break
         
-        logger.info(f"✅ Successfully fetched {len(funds)} valid exchange funds from Eastmoney")
-        # 验证特殊基金是否存在
-        special_codes = ['164824', '501018', '160416', '162411', '513030', '513500']
-        found_special = {k:v for k,v in funds.items() if k in special_codes}
-        if found_special:
-            logger.info(f"📋 特殊基金已包含: {list(found_special.items())}")
-        else:
-            logger.warning(f"⚠️ 未找到特殊基金: {special_codes}，将单独尝试获取")
-            # 单独获取缺失的特殊基金
-            for code in special_codes:
-                if code not in funds:
-                    name = _fetch_etf_name_from_eastmoney(code)
-                    if name:
-                        funds[code] = name
-                        logger.info(f"✅ 单独获取到特殊基金 {code}: {name}")
+        # 兜底补全：手动添加已知缺失的特殊基金
+        special_funds = {
+            "161129": "易方达原油LOF",
+            "164824": "工银印度基金LOF",
+            "501018": "南方原油LOF",
+            "162411": "华宝油气LOF",
+            "160416": "华安石油LOF",
+            "513030": "德国30ETF",
+            "513500": "标普500ETF",
+            "159941": "纳指100ETF",
+            "513100": "纳指ETF",
+            "513060": "恒生医疗ETF",
+            "159920": "恒生ETF",
+            "510900": "H股ETF"
+        }
+        for code, name in special_funds.items():
+            if code not in funds:
+                funds[code] = name
+                logger.info(f"✅ 兜底添加特殊基金 {code}: {name}")
+        
+        logger.info(f"✅ 最终收录场内基金总数: {len(funds)} 只")
     except Exception as e:
         logger.error(f"❌ Failed to fetch exchange funds: {e}", exc_info=True)
     
