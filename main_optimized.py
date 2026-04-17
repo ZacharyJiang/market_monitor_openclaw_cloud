@@ -771,19 +771,19 @@ def _parse_spot_row_sina(row: Dict, scale_hints: Dict[str, float]) -> Optional[D
 
 
 def _fetch_spot_from_endpoint(url: str) -> Dict[str, Dict]:
-        base_params = {
-            "pn": "1",
-            "pz": "1000",
-            "po": "1",
-            "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2",
-            "invt": "2",
-            "wbp2u": "|0|0|0|web",
-            "fid": "f12",
-            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17",
-            "fields": "f2,f3,f5,f6,f12,f14,f15,f16,f17,f18,f20,f21,f38,f441,f183,f184",
-        }
+    base_params = {
+        "pn": "1",
+        "pz": "1000",
+        "po": "1",
+        "np": "1",
+        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+        "fltt": "2",
+        "invt": "2",
+        "wbp2u": "|0|0|0|web",
+        "fid": "f12",
+        "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17",
+        "fields": "f2,f3,f5,f6,f12,f14,f15,f16,f17,f18,f20,f21,f38,f441,f183,f184",
+    }
 
     first = _request_json(url, base_params, retries=2)
     data = first.get("data") or {}
@@ -2245,34 +2245,34 @@ async def lifespan(app: FastAPI):
         coalesce=True,
     )
     # 添加独立溢价刷新任务，每5分钟运行一次
-        scheduler.add_job(
-            refresh_all_premium,
-            "interval",
-            minutes=5,
-            id="premium_refresh",
-            max_instances=1,
-            coalesce=True,
-        )
-        # 添加每日基金发现定时任务，每天凌晨2点执行，发现新增ETF/LOF，补全缺失基金
-        scheduler.add_job(
-            _ensure_all_etfs_in_spot,
-            "cron",
-            hour=2,
-            minute=0,
-            id="etf_discovery",
-            max_instances=1,
-            coalesce=True,
-        )
-        # 添加数据完整性校验定时任务，每小时运行一次，统计缺失数据并补全
-        scheduler.add_job(
-            check_and_fill_missing_data,
-            "interval",
-            minutes=60,
-            id="data_fill",
-            max_instances=1,
-            coalesce=True,
-        )
-        scheduler.start()
+    scheduler.add_job(
+        refresh_all_premium,
+        "interval",
+        minutes=5,
+        id="premium_refresh",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 添加每日基金发现定时任务，每天凌晨2点执行，发现新增ETF/LOF，补全缺失基金
+    scheduler.add_job(
+        _ensure_all_etfs_in_spot,
+        "cron",
+        hour=2,
+        minute=0,
+        id="etf_discovery",
+        max_instances=1,
+        coalesce=True,
+    )
+    # 添加数据完整性校验定时任务，每小时运行一次，统计缺失数据并补全
+    scheduler.add_job(
+        check_and_fill_missing_data,
+        "interval",
+        minutes=60,
+        id="data_fill",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
 
     # Warm up kline for all ETFs in background once (force=True to ensure all ETFs are fetched).
     # Use a lambda to pass force=True parameter.
