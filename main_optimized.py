@@ -1023,6 +1023,14 @@ async def fetch_premium_for_spot_async(spot: Dict[str, Dict]) -> Dict[str, Dict]
     
     elapsed = time.time() - start_time
     logger.info("Premium fetch completed: success=%s total=%s time=%.2fs", total_success, len(codes), elapsed)
+    
+    # 更新全局etf_spot中的溢价数据，确保异步更新生效
+    with _lock:
+        for code, premium in _premium_cache.items():
+            if code in etf_spot and premium != 0:
+                etf_spot[code]["premium"] = round(premium, 2)
+    save_spot_cache()
+    
     return spot
 
 # 新增独立的溢价刷新任务，单独运行不依赖spot刷新
@@ -1046,9 +1054,12 @@ def refresh_all_premium() -> None:
             logger.warning(f"Premium refresh batch {i//batch_size +1} failed: {e}")
         time.sleep(0.3)
     
-    # 更新last_updated时间戳
-    global last_updated
+    # 更新全局etf_spot中的溢价数据
     with _lock:
+        for code, premium in _premium_cache.items():
+            if code in etf_spot and premium != 0:
+                etf_spot[code]["premium"] = round(premium, 2)
+        # 更新last_updated时间戳
         last_updated = _now_bj_str()
     save_spot_cache()
     
@@ -1295,9 +1306,9 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
         except Exception as e:
             logger.debug(f"溢价获取失败 {code}: {e}")
         
-        # 限流控制，每20条请求后暂停3秒（降低频率避免东方财富限流）
-        if (idx + 1) % 20 == 0:
-            time.sleep(3)
+        # 限流控制，每10条请求后暂停2秒（降低频率避免东方财富限流）
+        if (idx + 1) % 10 == 0:
+            time.sleep(2)
     
     if results:
         _save_premium_cache()
@@ -1606,20 +1617,20 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
         # 获取所有场内基金列表（包括ETF、LOF等），分页获取避免数据截断
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         base_params = {
-            "pz": 2000,  # 每页2000条，减少分页次数
+            "pz": 1000,  # 每页1000条，东方财富接口最多支持每页1000条
             "po": 1,
             "np": 1,
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
             "fltt": 2,
             "invt": 2,
             "fid": "f12",
-            # 全类型覆盖：所有类型的场内基金，确保没有遗漏
-            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17",
+            # 全类型覆盖：所有类型的场内基金，确保没有遗漏（新增t:18商品、t:20债券）
+            "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17,m:0+t:18,m:1+t:18,m:0+t:20,m:1+t:20",
             "fields": "f12,f14",  # f12=代码, f14=名称，不再过滤价格
         }
         
-        # 分页获取，最多获取20页（40000只，覆盖所有场内基金）
-        for page in range(1, 21):
+        # 分页获取，最多获取40页（40000只，覆盖所有场内基金）
+        for page in range(1, 41):
             params = dict(base_params)
             params["pn"] = page
             params["_"] = int(time.time() * 1000)
@@ -1670,7 +1681,9 @@ def _fetch_all_exchange_funds() -> Dict[str, str]:
             "513100": "纳指ETF",
             "513060": "恒生医疗ETF",
             "159920": "恒生ETF",
-            "510900": "H股ETF"
+            "510900": "H股ETF",
+            "510300": "华泰柏瑞沪深300ETF",
+            "562510": "华夏纳斯达克100ETF"
         }
         for code, name in special_funds.items():
             if code not in funds:
@@ -1704,24 +1717,24 @@ def _ensure_all_etfs_in_spot() -> None:
         for code, data in existing_etf_data.items():
             etf_spot[code] = data
         # 再添加新发现的基金，只加原来没有的
-            for code, name in exchange_funds.items():
-                if code not in etf_spot and len(code) == 6:
-                    etf_spot[code] = {
-                        "code": code,
-                        "name": name,
-                        "currentPrice": 0.0,
-                        "chgPct": 0.0,
-                        "scale": 0.0,
-                        "source": "exchange_list"
-                    }
-                    added_count += 1
-                    logger.info(f"Added fund {code} ({name}) from exchange list")
-                    # 新基金自动触发费率和K线采集，不用等定时任务
-                    try:
-                        threading.Thread(target=_fetch_fee_from_eastmoney, args=(code,), daemon=True).start()
-                        threading.Thread(target=fetch_kline_live, args=(code,), daemon=True).start()
-                    except Exception as e:
-                        logger.debug(f"触发新基金{code}采集失败: {e}")
+        for code, name in exchange_funds.items():
+            if code not in etf_spot and len(code) == 6:
+                etf_spot[code] = {
+                    "code": code,
+                    "name": name,
+                    "currentPrice": 0.0,
+                    "chgPct": 0.0,
+                    "scale": 0.0,
+                    "source": "exchange_list"
+                }
+                added_count += 1
+                logger.info(f"Added fund {code} ({name}) from exchange list")
+                # 新基金自动触发费率和K线采集，不用等定时任务
+                try:
+                    threading.Thread(target=_fetch_fee_from_eastmoney, args=(code,), daemon=True).start()
+                    threading.Thread(target=fetch_kline_live, args=(code,), daemon=True).start()
+                except Exception as e:
+                    logger.debug(f"触发新基金{code}采集失败: {e}")
         
         # 2. 从 K 线文件中发现的 ETF（补充）
         if KLINE_DIR.exists():
@@ -1765,6 +1778,7 @@ def _ensure_all_etfs_in_spot() -> None:
         
         if added_count > 0:
             logger.info(f"Added {added_count} funds from all discovery sources")
+            save_spot_cache()
 
 
 def _prioritized_codes(limit: int = 0) -> List[str]:
@@ -1825,7 +1839,11 @@ def refresh_spot(force: bool = False) -> None:
 
         provider, new_spot = fetch_spot_live(scale_hints)
         if not new_spot:
-            raise RuntimeError("empty spot data")
+            logger.warning("Got empty spot data from live source, keeping existing data")
+            # 即使没有新数据，也要更新last_updated，避免前端显示过期太久
+            with _lock:
+                last_updated = _now_bj_str()
+            return
 
         # 异步获取溢价数据（不阻塞主线程）
         try:
@@ -2114,59 +2132,6 @@ def check_and_fill_missing_data():
         logger.error(f"❌ 数据补全任务失败: {e}", exc_info=True)
 
 
-def refresh_all_fees() -> None:
-    """
-    批量采集所有 ETF 的费率数据。
-    独立于 K 线采集，确保费率数据完整。
-    """
-    if not etf_spot:
-        logger.warning("No ETF spot data available, skipping fee refresh")
-        return
-    
-    # 获取全部 ETF，按规模降序排列
-    all_codes = _prioritized_codes(limit=0)
-    if not all_codes:
-        return
-    
-    # 找出费率数据缺失的 ETF
-    missing_fee_codes = [code for code in all_codes if code not in _fee_cache]
-    
-    logger.info("Starting fee refresh: total_etfs=%s, missing_fees=%s", 
-                len(all_codes), len(missing_fee_codes))
-    
-    done = 0
-    failed = 0
-    
-    # 优先采集缺失费率的 ETF
-    for code in missing_fee_codes:
-        try:
-            if _fetch_fee_from_eastmoney(code):
-                done += 1
-        except Exception as exc:
-            failed += 1
-            logger.debug("Fee refresh failed for %s: %s", code, exc)
-    
-    # 再随机采集一部分已有费率的 ETF 进行更新（避免数据过期）
-    existing_fee_codes = [code for code in all_codes if code in _fee_cache]
-    import random
-    sample_size = min(50, len(existing_fee_codes))  # 每天更新50个已有费率的 ETF
-    sample_codes = random.sample(existing_fee_codes, sample_size) if existing_fee_codes else []
-    
-    for code in sample_codes:
-        try:
-            if _fetch_fee_from_eastmoney(code):
-                done += 1
-        except Exception as exc:
-            logger.debug("Fee refresh (update) failed for %s: %s", code, exc)
-    
-    logger.info(
-        "Fee refresh done: updated=%s failed=%s total missing=%s",
-        done,
-        failed,
-        len(missing_fee_codes),
-    )
-
-
 # ============================================================
 # FASTAPI APP
 # ============================================================
@@ -2181,13 +2146,17 @@ async def lifespan(app: FastAPI):
     _load_fee_cache()
     cache_loaded = load_spot_cache()
 
-    # Startup: always try one live refresh first.
+    # 启动初始化：先发现基金，再刷新行情
     # 在后台线程中执行，避免阻塞启动
-    def startup_refresh():
+    def startup_init():
         time.sleep(2)  # 等待服务完全启动
+        # 先执行基金发现
+        _ensure_all_etfs_in_spot()
+        logger.info("After ETF discovery: total etfs=%s", len(etf_spot))
+        # 再执行首次行情刷新
         refresh_spot(force=True)
     
-    threading.Thread(target=startup_refresh, daemon=True).start()
+    threading.Thread(target=startup_init, daemon=True).start()
 
     with _lock:
         if not etf_spot:
@@ -2205,15 +2174,6 @@ async def lifespan(app: FastAPI):
         len(etf_spot),
         cache_loaded,
     )
-
-    # 确保所有场内基金都在列表中（包括ETF、LOF、QDII等）
-    # 使用延迟执行，避免启动时阻塞
-    def delayed_discovery():
-        time.sleep(5)
-        _ensure_all_etfs_in_spot()
-        logger.info("After ETF discovery: total etfs=%s", len(etf_spot))
-    
-    threading.Thread(target=delayed_discovery, daemon=True).start()
 
     scheduler.add_job(
         refresh_spot,
@@ -2318,6 +2278,12 @@ app = FastAPI(title="ETF NEXUS", lifespan=lifespan)
 @app.get("/api/etf-data")
 async def get_etf_data():
     with _lock:
+        if not etf_spot:
+            # 尝试加载缓存
+            load_spot_cache()
+            if not etf_spot:
+                # 缓存也没有，执行基金发现
+                _ensure_all_etfs_in_spot()
         etfs = []
         for code, spot in etf_spot.items():
             stats = etf_stats.get(code, {})
@@ -2339,13 +2305,17 @@ async def get_etf_data():
                     row["fee"] = round(sum(fee_detail.values()), 2)
                     row["feeDetail"] = _format_fee_detail(fee_detail)
             row.setdefault("feeDetail", "")
-            # 添加溢价数据（如果存在）
-            if "premium" not in row and code in _premium_cache:
-                cached_premium = _premium_cache[code]
-                # 只使用非零的有效溢价值（0表示无数据，不应展示）
-                if cached_premium is not None and cached_premium != 0:
-                    row["premium"] = cached_premium
-            row.setdefault("premium", None)
+            # 添加溢价数据（优先使用缓存中的有效数据，避免异步更新不及时的问题）
+            cached_premium = _premium_cache.get(code)
+            if cached_premium is not None and cached_premium != 0:
+                row["premium"] = round(cached_premium, 2)
+            else:
+                # 缓存没有有效数据，使用spot中的数据（如果有）
+                spot_premium = spot.get("premium")
+                if spot_premium is not None and spot_premium != 0:
+                    row["premium"] = round(spot_premium, 2)
+                else:
+                    row["premium"] = None
             etfs.append(row)
 
         return JSONResponse(
