@@ -2508,12 +2508,46 @@ async def diag():
                 break
             sample.append({**spot, "stats": etf_stats.get(code, {})})
 
-    # 测试fundgz接口在当前环境是否可用
+    # 测试fundgz接口在当前环境是否可用（分步诊断）
     fundgz_test = None
+    trends2_test = None
     try:
-        fundgz_test = _fetch_nav_from_fundgz("510050")
+        # 步骤1: 测试trends2接口
+        _test_session = requests.Session()
+        _test_session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Referer": "https://quote.eastmoney.com/"
+        })
+        secid = "1.510050"
+        url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+        params = {
+            "secid": secid,
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "fltt": "2",
+        }
+        resp = _test_session.get(url, params=params, timeout=5)
+        if resp.status_code == 200:
+            _data = resp.json().get("data", {})
+            _trends = _data.get("trends", [])
+            if _trends:
+                _last = _trends[-1]
+                _parts = str(_last).split(",")
+                trends2_test = f"ok: iopv={_parts[-1]}, trends_count={len(_trends)}"
+            else:
+                trends2_test = f"no_trends: data_keys={list(_data.keys())}"
+        else:
+            trends2_test = f"http_{resp.status_code}"
     except Exception as e:
-        fundgz_test = f"error: {e}"
+        trends2_test = f"error: {type(e).__name__}: {e}"
+    
+    try:
+        # 步骤2: 测试fundgz接口
+        fundgz_nav = _fetch_nav_from_fundgz("510050")
+        fundgz_test = fundgz_nav
+    except Exception as e:
+        fundgz_test = f"error: {type(e).__name__}: {e}"
 
     return {
         "current_source": data_source,
@@ -2525,6 +2559,7 @@ async def diag():
         "rate_limiter": request_controller.status(),
         "sample_etfs": sample,
         "fundgz_test": {"code": "510050", "nav": fundgz_test},
+        "trends2_test": trends2_test,
         "premium_cache_size": len(_premium_cache),
     }
 
