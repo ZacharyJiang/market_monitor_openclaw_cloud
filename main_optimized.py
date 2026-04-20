@@ -1254,8 +1254,15 @@ def _fetch_nav_from_fundgz(code: str, session: requests.Session = None) -> Optio
         })
     
     try:
-        url = f"http://fundgz.1234567.com.cn/js/{code}.js"
-        resp = session.get(url, timeout=5)
+        # 优先使用HTTPS，部分Docker环境可能阻止HTTP请求
+        url = f"https://fundgz.1234567.com.cn/js/{code}.js"
+        try:
+            resp = session.get(url, timeout=5)
+        except Exception:
+            # HTTPS失败时回退到HTTP
+            url = f"http://fundgz.1234567.com.cn/js/{code}.js"
+            resp = session.get(url, timeout=5)
+            
         if resp.status_code != 200:
             return None
         
@@ -1304,6 +1311,10 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
     results = {}
     if not codes:
         return results
+    
+    # 诊断：测试fundgz接口是否可用
+    _test_nav = _fetch_nav_from_fundgz("510050")
+    logger.info(f"溢价采集诊断: fundgz接口测试510050, nav={_test_nav}, 接口{'可用' if _test_nav else '不可用'}")
     
     session = requests.Session()
     session.headers.update({
