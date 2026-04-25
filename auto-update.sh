@@ -1,10 +1,12 @@
 #!/bin/bash
-# 自动拉取 GitHub 最新代码并重启服务
-# v2: 代码通过卷挂载，更新只需 git pull + docker restart，不再重建镜像
+# 自动拉取 GitHub 最新代码并重启服务（无 Docker 模式）
 
-REPO_PATH="${REPO_PATH:-/app}"
+REPO_PATH="${REPO_PATH:-/root/.openclaw/workspace_coder/a_share_market_monitor}"
 LOG_FILE="${REPO_PATH}/logs/auto-update.log"
-CONTAINER_NAME="${CONTAINER_NAME:-a-share-etf-monitor}"
+APP_LOG="${REPO_PATH}/logs/app.log"
+UVICORN_BIN="${UVICORN_BIN:-/usr/local/bin/uvicorn}"
+PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+APP_PORT="${APP_PORT:-8080}"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -36,15 +38,31 @@ echo "[INFO] 发现新版本: $LOCAL -> $REMOTE"
 git pull origin main || { echo "[ERROR] git pull 失败"; exit 1; }
 echo "[INFO] 代码更新完成"
 
-# 重启容器（代码通过卷挂载，restart 即可生效，无需重建镜像）
-echo "[INFO] 重启容器 $CONTAINER_NAME ..."
-if docker restart "$CONTAINER_NAME"; then
-    echo "[SUCCESS] 容器重启成功，新代码已生效"
+# 找到正在运行的 uvicorn 进程并终止
+OLD_PID=$(pgrep -f "uvicorn main_optimized:app" | head -1)
+if [ -n "$OLD_PID" ]; then
+    echo "[INFO] 终止旧进程 PID=$OLD_PID ..."
+    kill "$OLD_PID"
+    sleep 3
 else
-    echo "[WARN] docker restart 失败，尝试 docker stop + start ..."
-    docker stop "$CONTAINER_NAME" && docker start "$CONTAINER_NAME" && \
-        echo "[SUCCESS] 容器重启成功" || \
-        echo "[ERROR] 容器重启失败，请手动检查"
+    echo "[WARN] 未找到运行中的 uvicorn 进程"
+fi
+
+# 重新启动
+echo "[INFO] 启动新进程..."
+source .env 2>/dev/null || true
+nohup "$PYTHON_BIN" "$UVICORN_BIN" main_optimized:app \
+    --host 0.0.0.0 --port "$APP_PORT" \
+    >> "$APP_LOG" 2>&1 &
+
+NEW_PID=$!
+sleep 2
+
+if kill -0 "$NEW_PID" 2>/dev/null; then
+    echo "[SUCCESS] 新进程启动成功 PID=$NEW_PID"
+else
+    echo "[ERROR] 新进程启动失败，请检查 $APP_LOG"
+    exit 1
 fi
 
 echo "=== 更新完成 $(date '+%Y-%m-%d %H:%M:%S') ==="
