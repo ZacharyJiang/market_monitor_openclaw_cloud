@@ -78,6 +78,7 @@ CIRCUIT_BREAKER_COOLDOWN = _env_int("CIRCUIT_BREAKER_COOLDOWN", 180)
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 SPOT_CACHE = DATA_DIR / "spot_cache.json"
+CACHE_VERSION = "2"  # increment when data schema or calculation logic changes
 FEE_CACHE_FILE = DATA_DIR / "fee_cache.json"
 KLINE_DIR = DATA_DIR / "kline"
 KLINE_DIR.mkdir(exist_ok=True)
@@ -569,6 +570,7 @@ def _format_fee_detail(detail: Dict[str, float]) -> str:
 def save_spot_cache() -> None:
     with _lock:
         payload = {
+            "version": CACHE_VERSION,
             "spot": etf_spot,
             "stats": etf_stats,
             "indices": market_indices,
@@ -589,6 +591,10 @@ def load_spot_cache() -> bool:
         return False
     try:
         data = json.loads(SPOT_CACHE.read_text(encoding="utf-8"))
+        if data.get("version") != CACHE_VERSION:
+            logger.warning("Spot cache version mismatch (got %s, want %s), discarding", data.get("version"), CACHE_VERSION)
+            return False
+
         raw_source = str(data.get("source", "")).lower().strip()
         if raw_source in {"mock", "demo"}:
             logger.warning("Ignore legacy mock cache")
