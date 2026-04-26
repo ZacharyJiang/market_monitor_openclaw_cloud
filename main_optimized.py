@@ -272,6 +272,16 @@ if _PROXY:
 else:
     logger.info("No proxy configured — direct market requests")
 
+# 独立的费率采集 session，不经过共享限流器，避免拖慢行情请求
+_FEE_SESSION = requests.Session()
+_FEE_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://fundf10.eastmoney.com/",
+})
+_fee_rate_lock = threading.Lock()
+_fee_last_call_at: float = 0.0
+_FEE_INTERVAL = 0.8  # 费率页面请求间隔（秒）
+
 
 # ============================================================
 # GLOBAL STORE
@@ -787,11 +797,17 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
             premium_source = "cache"
 
     # 优先级4：用NAV缓存计算（LOF/QDII/REIT基金，f441=0但有每日公布净值）
+    # 价格优先级：f2(实时价) > etf_spot currentPrice(今日收盘) > f18(昨收)
     if premium_value is None:
         nav_entry = _nav_cache.get(code)
         if nav_entry:
             nav_val = nav_entry.get("nav", 0)
-            ref_price = price if price > 0 else _safe_float(row.get("f18"))
+            ref_price = price if price > 0 else 0
+            if ref_price <= 0:
+                with _lock:
+                    ref_price = etf_spot.get(code, {}).get("currentPrice") or 0
+            if ref_price <= 0:
+                ref_price = _safe_float(row.get("f18"))
             if nav_val > 0 and ref_price > 0:
                 calc = round(((ref_price - nav_val) / nav_val) * 100, 2)
                 if abs(calc) < 30:
@@ -1567,10 +1583,13 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                     f441_val = rdata["f441"]
                     spot_price = rdata["price"]
                     if spot_price <= 0:
+                        with _lock:
+                            spot_price = etf_spot.get(code, {}).get("currentPrice") or 0
+                    if spot_price <= 0:
                         spot_price = rdata.get("prevClose", 0)
                     if spot_price <= 0:
                         with _lock:
-                            spot_price = etf_spot.get(code, {}).get("prevClose") or etf_spot.get(code, {}).get("currentPrice", 0)
+                            spot_price = etf_spot.get(code, {}).get("prevClose") or 0
                     
                     if f441_val is not None and f441_val > 0 and spot_price > 0:
                         iopv = f441_val
@@ -1598,13 +1617,17 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                         continue
 
                     # 优先级4：用NAV缓存计算（LOF/QDII/REIT，f441=0）
+                    # 价格优先级：今日收盘价(etf_spot currentPrice) > f18(昨收)
                     nav_entry = _nav_cache.get(code)
                     if nav_entry:
                         nav_val = nav_entry.get("nav", 0)
-                        ref_price = rdata.get("prevClose", 0) if rdata else 0
+                        with _lock:
+                            spot_info = etf_spot.get(code, {})
+                        ref_price = spot_info.get("currentPrice") or 0
                         if ref_price <= 0:
-                            with _lock:
-                                ref_price = etf_spot.get(code, {}).get("prevClose", 0)
+                            ref_price = rdata.get("prevClose", 0) if rdata else 0
+                        if ref_price <= 0:
+                            ref_price = spot_info.get("prevClose") or 0
                         if nav_val > 0 and ref_price > 0:
                             calc = round(((ref_price - nav_val) / nav_val) * 100, 2)
                             if abs(calc) < 30:
@@ -1632,13 +1655,20 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
 
 def _fetch_fee_from_eastmoney(code: str) -> bool:
     """Fetch management/custody/sales fees from Eastmoney fund fee detail HTML page."""
+    global _fee_last_call_at
     try:
+        # 独立限流：不占共享 request_controller，避免拖慢行情请求
+        with _fee_rate_lock:
+            elapsed = time.time() - _fee_last_call_at
+            wait = _FEE_INTERVAL - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            _fee_last_call_at = time.time()
+
         url = f"https://fundf10.eastmoney.com/jjfl_{code}.html"
-        text = _request_text(
-            url,
-            retries=1,
-            headers={"Referer": f"https://fundf10.eastmoney.com/jjfl_{code}.html"},
-        )
+        resp = _FEE_SESSION.get(url, timeout=10)
+        resp.raise_for_status()
+        text = resp.text
         if not text:
             return False
 
