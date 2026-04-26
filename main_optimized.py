@@ -80,6 +80,7 @@ DATA_DIR.mkdir(exist_ok=True)
 SPOT_CACHE = DATA_DIR / "spot_cache.json"
 CACHE_VERSION = "2"  # increment when data schema or calculation logic changes
 FEE_CACHE_FILE = DATA_DIR / "fee_cache.json"
+NAV_CACHE_FILE = DATA_DIR / "nav_cache.json"
 KLINE_DIR = DATA_DIR / "kline"
 KLINE_DIR.mkdir(exist_ok=True)
 
@@ -90,6 +91,9 @@ _premium_cache_file = DATA_DIR / "premium_cache.json"
 # 收盘溢价数据缓存
 _close_premium_cache: Dict[str, Dict] = {}
 _close_premium_cache_file = DATA_DIR / "close_premium_cache.json"
+
+# NAV缓存：LOF/QDII/REIT基金每日公布的单位净值
+_nav_cache: Dict[str, Dict] = {}  # {code: {"nav": float, "date": str}}
 
 
 def _load_premium_cache():
@@ -128,6 +132,25 @@ def _save_close_premium_cache():
         _close_premium_cache_file.write_text(json.dumps(_close_premium_cache, ensure_ascii=False), encoding="utf-8")
     except Exception:
         pass
+
+
+def _load_nav_cache() -> None:
+    global _nav_cache
+    if NAV_CACHE_FILE.exists():
+        try:
+            _nav_cache = json.loads(NAV_CACHE_FILE.read_text(encoding="utf-8"))
+            logger.info("NAV cache loaded: %d funds", len(_nav_cache))
+        except Exception:
+            _nav_cache = {}
+    else:
+        _nav_cache = {}
+
+
+def _save_nav_cache() -> None:
+    try:
+        NAV_CACHE_FILE.write_text(json.dumps(_nav_cache, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        logger.debug("Save nav cache failed: %s", exc)
 
 
 def save_close_premium_at_market_close(session: str = "afternoon"):
@@ -748,13 +771,27 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
                 with _lock:
                     _premium_cache[code] = premium_value
 
-    # 优先级3：使用缓存
+    # 优先级3：使用premium缓存
     if premium_value is None:
         with _lock:
             cached_premium = _premium_cache.get(code)
         if cached_premium is not None and cached_premium != 0 and abs(cached_premium) < 30:
             premium_value = round(cached_premium, 2)
             premium_source = "cache"
+
+    # 优先级4：用NAV缓存计算（LOF/QDII/REIT基金，f441=0但有每日公布净值）
+    if premium_value is None:
+        nav_entry = _nav_cache.get(code)
+        if nav_entry:
+            nav_val = nav_entry.get("nav", 0)
+            ref_price = price if price > 0 else _safe_float(row.get("f18"))
+            if nav_val > 0 and ref_price > 0:
+                calc = round(((ref_price - nav_val) / nav_val) * 100, 2)
+                if abs(calc) < 30:
+                    premium_value = calc
+                    premium_source = "nav_cache"
+                    with _lock:
+                        _premium_cache[code] = premium_value
 
     # 净值(IOPV)：f441即为IOPV参考净值
     if f441_raw is not None and f441_raw > 0:
@@ -1461,7 +1498,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                     "wbp2u": "|0|0|0|web",
                     "fid": "f12",
                     "fs": "m:0+t:10,m:1+t:10,m:0+t:11,m:1+t:11,m:0+t:12,m:1+t:12,m:0+t:13,m:1+t:13,m:0+t:14,m:1+t:14,m:0+t:15,m:1+t:15,m:0+t:16,m:1+t:16,m:0+t:17,m:1+t:17,m:0+t:18,m:1+t:18,m:0+t:20,m:1+t:20",
-                    "fields": "f2,f12,f402,f441",
+                    "fields": "f2,f12,f18,f402,f441",
                 }
                 session = requests.Session()
                 session.headers.update({
@@ -1482,6 +1519,7 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                     if rcode in codes or rcode in etf_spot:
                         row_map[rcode] = {
                             "price": _safe_float(row.get("f2")),
+                            "prevClose": _safe_float(row.get("f18")),
                             "f402": _safe_float(row.get("f402")),
                             "f441": _safe_float(row.get("f441")),
                         }
@@ -1518,12 +1556,14 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                         continue
                     
                     # 优先级2：f441(IOPV) + price 计算
+                    # 非交易时段 f2=0，改用 f18(prevClose) 计算上一交易日收盘溢价
                     f441_val = rdata["f441"]
                     spot_price = rdata["price"]
-                    # 也从etf_spot获取价格（列表API的f2可能为0）
+                    if spot_price <= 0:
+                        spot_price = rdata.get("prevClose", 0)
                     if spot_price <= 0:
                         with _lock:
-                            spot_price = etf_spot.get(code, {}).get("currentPrice", 0)
+                            spot_price = etf_spot.get(code, {}).get("prevClose") or etf_spot.get(code, {}).get("currentPrice", 0)
                     
                     if f441_val is not None and f441_val > 0 and spot_price > 0:
                         iopv = f441_val
@@ -1542,13 +1582,31 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                                 iopv_calc_success += 1
                                 continue
                     
-                    # 优先级3：使用缓存
+                    # 优先级3：使用premium缓存
                     with _lock:
                         cached_val = _premium_cache.get(code)
                     if cached_val is not None and cached_val != 0 and abs(cached_val) < 30:
                         results[code] = cached_val
                         cache_hit += 1
-                
+                        continue
+
+                    # 优先级4：用NAV缓存计算（LOF/QDII/REIT，f441=0）
+                    nav_entry = _nav_cache.get(code)
+                    if nav_entry:
+                        nav_val = nav_entry.get("nav", 0)
+                        ref_price = rdata.get("prevClose", 0) if rdata else 0
+                        if ref_price <= 0:
+                            with _lock:
+                                ref_price = etf_spot.get(code, {}).get("prevClose", 0)
+                        if nav_val > 0 and ref_price > 0:
+                            calc = round(((ref_price - nav_val) / nav_val) * 100, 2)
+                            if abs(calc) < 30:
+                                results[code] = calc
+                                with _lock:
+                                    _premium_cache[code] = calc
+                                    if code in etf_spot:
+                                        etf_spot[code]["premium"] = calc
+
                 break  # 成功从某个endpoint获取数据，不再尝试其他
             
             except Exception as e:
@@ -2163,6 +2221,65 @@ def refresh_spot(force: bool = False) -> None:
                 live_provider = "none"
 
 
+def refresh_nav_batch() -> None:
+    """
+    每日批量采集所有ETF/LOF的单位净值（NAV）并缓存。
+    用于非交易时段计算 LOF/QDII/REIT 基金的溢价率。
+    每天收盘后（20:00）运行一次，采集当日公布的净值。
+    """
+    if not etf_spot:
+        logger.warning("No ETF spot data, skip nav refresh")
+        return
+
+    all_codes = list(etf_spot.keys())
+    today = _today_bj_str()
+    done = 0
+    skipped = 0
+    nav_updated_premiums = 0
+
+    logger.info("Starting NAV batch refresh for %d funds", len(all_codes))
+
+    for code in all_codes:
+        cached = _nav_cache.get(code, {})
+        if cached.get("date") == today and cached.get("nav", 0) > 0:
+            skipped += 1
+            continue
+        try:
+            payload = _request_json_external(
+                "https://api.fund.eastmoney.com/f10/lsjz",
+                params={"fundCode": code, "pageIndex": 1, "pageSize": 1},
+                retries=1,
+                headers={"Referer": f"https://fund.eastmoney.com/{code}.html"},
+            )
+            lst = (payload.get("Data") or {}).get("LSJZList") or []
+            if lst:
+                nav = _safe_float(lst[0].get("DWJZ", 0))
+                nav_date = lst[0].get("FSRQ", today)
+                if nav > 0:
+                    with _lock:
+                        _nav_cache[code] = {"nav": nav, "date": nav_date}
+                    done += 1
+                    # 立即用昨收价更新premium缓存（非交易时段也能显示溢价）
+                    prev_close = etf_spot.get(code, {}).get("prevClose", 0) or 0
+                    if prev_close > 0:
+                        calc = round(((prev_close - nav) / nav) * 100, 2)
+                        if abs(calc) < 30 and code not in _premium_cache:
+                            with _lock:
+                                _premium_cache[code] = calc
+                                if code in etf_spot:
+                                    etf_spot[code]["premium"] = calc
+                            nav_updated_premiums += 1
+        except Exception as exc:
+            logger.debug("NAV fetch failed for %s: %s", code, exc)
+
+    _save_nav_cache()
+    _save_premium_cache()
+    logger.info(
+        "NAV batch done: fetched=%d skipped=%d premium_filled=%d",
+        done, skipped, nav_updated_premiums,
+    )
+
+
 def refresh_all_fees() -> None:
     """
     批量采集所有 ETF 的费率数据。
@@ -2409,6 +2526,7 @@ async def lifespan(app: FastAPI):
     global data_source, live_provider
 
     _load_fee_cache()
+    _load_nav_cache()
     cache_loaded = load_spot_cache()
 
     # 启动初始化：先发现基金，再刷新行情
@@ -2514,14 +2632,27 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
+    # NAV批量采集：每天20:00（北京时间）运行，覆盖当日收盘后公布的净值
+    scheduler.add_job(
+        refresh_nav_batch,
+        "cron",
+        hour=12,  # UTC 12:00 = 北京时间 20:00
+        minute=0,
+        id="nav_refresh",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.start()
 
     # Warm up kline for all ETFs in background once (force=True to ensure all ETFs are fetched).
     # Use a lambda to pass force=True parameter.
     threading.Thread(target=lambda: refresh_kline_batch(force=True), daemon=True).start()
-    
+
     # 启动时也在后台采集缺失的费率数据
     threading.Thread(target=refresh_all_fees, daemon=True).start()
+
+    # 启动时在后台采集NAV，用于填充非交易时段溢价
+    threading.Thread(target=refresh_nav_batch, daemon=True).start()
 
     # Back-fill stats from any existing kline files that lack the new fields
     # (e.g. after a server upgrade where compute_stats gained new columns).
