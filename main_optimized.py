@@ -1133,6 +1133,48 @@ def _supplement_with_tencent(spot: Dict[str, Dict], fund_names: Dict[str, str]) 
     return filled
 
 
+def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
+    """
+    For ETFs with scale=0, fetch quarterly scale data from pingzhongdata JS
+    (Data_fluctuationScale field) and update etf_spot in place.
+    Returns count of codes filled.
+    """
+    import re as _re
+    filled = 0
+    for code in codes:
+        try:
+            url = f"http://fund.eastmoney.com/pingzhongdata/{code}.js"
+            text = _request_text(
+                url,
+                retries=1,
+                headers={"Referer": "http://fund.eastmoney.com/"},
+            )
+            if not text:
+                continue
+            m = _re.search(r'var\s+Data_fluctuationScale\s*=\s*(\{.*?\})\s*;', text, _re.DOTALL)
+            if not m:
+                continue
+            data = json.loads(m.group(1))
+            series = data.get('series', [])
+            if not series:
+                continue
+            latest = series[-1].get('y')
+            if latest and float(latest) > 0:
+                scale_val = round(float(latest), 2)
+                with _lock:
+                    if code in etf_spot:
+                        existing = etf_spot[code].get('scale') or 0
+                        if not existing or existing == 0:
+                            etf_spot[code]['scale'] = scale_val
+                            filled += 1
+        except Exception as exc:
+            logger.debug("Scale supplement failed for %s: %s", code, exc)
+        time.sleep(0.2)
+
+    logger.info("Pingzhong scale supplement filled %d/%d zero-scale ETFs", filled, len(codes))
+    return filled
+
+
 # 独立的溢价刷新任务，不依赖spot刷新
 def refresh_all_premium() -> None:
     """刷新所有ETF的溢价数据，独立定时任务"""
@@ -1524,57 +1566,43 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
 
 
 def _fetch_fee_from_eastmoney(code: str) -> bool:
-    """Fetch management fee and other fees from Eastmoney fund page"""
-    for secid in _secid_candidates(code):
-        try:
-            # Eastmoney fund details API
-            url = "https://api.fund.eastmoney.com/fund/archives"
-            params = {
-                "fundcode": code,
-                "pageIndex": 1,
-                "pageSize": 1,
-            }
-            headers = {
-                "Referer": f"http://fund.eastmoney.com/{code}.html",
-            }
-            payload = _request_json(url, params, retries=1, headers=headers)
-            if not payload or not payload.get("data"):
-                continue
-            
-            # 尝试从另一个接口获取费率信息
-            info_url = f"http://fund.eastmoney.com/pingzhongdata/{code}.js"
-            text = _request_text(info_url, retries=1, headers={"Referer": f"http://fund.eastmoney.com/{code}.html"})
-            if not text:
-                continue
-            
-            #  parse fees
-            import re
-            fee_match = re.search(r'"fund_management_rate":\s*"([\d.]+)"', text)
-            custody_match = re.search(r'"fund_custodian_rate":\s*"([\d.]+)"', text)
-            sales_match = re.search(r'"fund_recurring_purchase_rate":\s*"([\d.]+)"', text)
-            
-            fees: Dict[str, float] = {}
-            if fee_match:
-                fees["管理费"] = _safe_float(fee_match.group(1))
-            if custody_match:
-                fees["托管费"] = _safe_float(custody_match.group(1))
-            if sales_match:
-                fees["销售服务费"] = _safe_float(sales_match.group(1))
-            
-            if fees:
-                with _lock:
-                    _fee_cache[code] = fees
-                    # save to disk
-                    try:
-                        FEE_CACHE_FILE.write_text(json.dumps(_fee_cache, ensure_ascii=False), encoding="utf-8")
-                    except Exception:
-                        pass
-                logger.debug("Updated fees for %s: %s", code, fees)
-                return True
-            
-        except Exception as exc:
-            logger.debug("Fetch fee failed for %s: %s", code, exc)
-    
+    """Fetch management/custody/sales fees from Eastmoney fund fee detail HTML page."""
+    try:
+        url = f"https://fundf10.eastmoney.com/jjfl_{code}.html"
+        text = _request_text(
+            url,
+            retries=1,
+            headers={"Referer": f"https://fundf10.eastmoney.com/jjfl_{code}.html"},
+        )
+        if not text:
+            return False
+
+        import re
+        mgmt_m = re.search(r'管理费率</td><td[^>]*>([\d.]+)%', text)
+        cust_m = re.search(r'托管费率</td><td[^>]*>([\d.]+)%', text)
+        sales_m = re.search(r'销售服务费率</td><td[^>]*>([\d.]+)%', text)
+
+        fees: Dict[str, float] = {}
+        if mgmt_m:
+            fees["管理费"] = _safe_float(mgmt_m.group(1))
+        if cust_m:
+            fees["托管费"] = _safe_float(cust_m.group(1))
+        if sales_m and _safe_float(sales_m.group(1)) > 0:
+            fees["销售服务费"] = _safe_float(sales_m.group(1))
+
+        if fees:
+            with _lock:
+                _fee_cache[code] = fees
+                try:
+                    FEE_CACHE_FILE.write_text(json.dumps(_fee_cache, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+            logger.debug("Updated fees for %s: %s", code, fees)
+            return True
+
+    except Exception as exc:
+        logger.debug("Fetch fee failed for %s: %s", code, exc)
+
     return False
 
 
@@ -2188,6 +2216,16 @@ def refresh_all_fees() -> None:
         failed,
         len(missing_fee_codes),
     )
+
+    # Supplement scale data for ETFs still showing scale=0
+    with _lock:
+        zero_scale_codes = [
+            code for code, info in etf_spot.items()
+            if not info.get("scale") or info.get("scale") == 0
+        ]
+    if zero_scale_codes:
+        logger.info("Supplementing scale from pingzhong for %d ETFs", len(zero_scale_codes))
+        _supplement_scale_from_pingzhong(zero_scale_codes)
 
 
 def refresh_kline_batch(force: bool = False) -> None:
