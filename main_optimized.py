@@ -282,6 +282,19 @@ _fee_rate_lock = threading.Lock()
 _fee_last_call_at: float = 0.0
 _FEE_INTERVAL = 0.8  # 费率页面请求间隔（秒）
 
+# 独立的 pingzhongdata 采集 session（规模补充用），不占主限流器
+_PINGZHONG_SESSION = requests.Session()
+_PINGZHONG_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "http://fund.eastmoney.com/",
+})
+_pingzhong_rate_lock = threading.Lock()
+_pingzhong_last_call_at: float = 0.0
+_PINGZHONG_INTERVAL = 1.0  # pingzhong 请求间隔（秒）
+
+# 溢价刷新时间戳（非交易时段限频用）
+_premium_last_full_refresh: float = 0.0
+
 
 # ============================================================
 # GLOBAL STORE
@@ -1197,18 +1210,25 @@ def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
     """
     For ETFs with scale=0, fetch quarterly scale data from pingzhongdata JS
     (Data_fluctuationScale field) and update etf_spot in place.
+    Uses dedicated _PINGZHONG_SESSION (1s interval), does not touch main rate limiter.
     Returns count of codes filled.
     """
+    global _pingzhong_last_call_at
     import re as _re
     filled = 0
     for code in codes:
         try:
+            with _pingzhong_rate_lock:
+                elapsed = time.time() - _pingzhong_last_call_at
+                wait = _PINGZHONG_INTERVAL - elapsed
+                if wait > 0:
+                    time.sleep(wait)
+                _pingzhong_last_call_at = time.time()
+
             url = f"http://fund.eastmoney.com/pingzhongdata/{code}.js"
-            text = _request_text(
-                url,
-                retries=1,
-                headers={"Referer": "http://fund.eastmoney.com/"},
-            )
+            resp = _PINGZHONG_SESSION.get(url, timeout=10)
+            resp.raise_for_status()
+            text = resp.text
             if not text:
                 continue
             m = _re.search(r'var\s+Data_fluctuationScale\s*=\s*(\{.*?\})\s*;', text, _re.DOTALL)
@@ -1229,7 +1249,6 @@ def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
                             filled += 1
         except Exception as exc:
             logger.debug("Scale supplement failed for %s: %s", code, exc)
-        time.sleep(0.2)
 
     logger.info("Pingzhong scale supplement filled %d/%d zero-scale ETFs", filled, len(codes))
     return filled
@@ -1237,11 +1256,22 @@ def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
 
 # 独立的溢价刷新任务，不依赖spot刷新
 def refresh_all_premium() -> None:
-    """刷新所有ETF的溢价数据，独立定时任务"""
-    global last_updated
+    """
+    刷新所有ETF的溢价数据。
+    - 交易时段：每5分钟执行（由调度器控制）
+    - 非交易时段：最多30分钟执行一次，避免频繁请求
+    """
+    global last_updated, _premium_last_full_refresh
     if not etf_spot:
         logger.warning("No ETF spot data available, skipping premium refresh")
         return
+
+    if not is_trading_time():
+        now = time.time()
+        if now - _premium_last_full_refresh < 1800:  # 30分钟内已刷新过
+            logger.debug("Skip premium refresh (non-trading, last refresh <30min ago)")
+            return
+    _premium_last_full_refresh = time.time()
 
     all_codes = list(etf_spot.keys())
     logger.info("Starting full premium refresh for %s ETFs...", len(all_codes))
@@ -1797,10 +1827,31 @@ def compute_stats(kline: List[Dict]) -> Dict:
 
 def is_trading_day() -> bool:
     """
-    判断是否为交易日（周一到周五）。
-    注意：此函数仅用于实时行情判断，K线历史数据采集不受此限制。
+    判断是否为A股交易日。
+    - 周六/日直接返回 False
+    - 工作日：用 _nav_cache 的最近净值日期验证（能识别法定节假日）
+      若 nav_cache 未加载则退化为纯工作日判断（最多误判节假日）
     """
-    return datetime.now(BEIJING_TZ).weekday() < 5
+    now = datetime.now(BEIJING_TZ)
+    if now.weekday() >= 5:
+        return False
+    today = now.strftime("%Y-%m-%d")
+    # 利用 NAV 缓存：净值日期 = 最近交易日。若今天 < 最近交易日，说明今天是节假日
+    if _nav_cache:
+        dates = [v.get("date", "") for v in _nav_cache.values() if v.get("date")]
+        if dates:
+            last_trading_date = max(dates)
+            # 最近交易日比今天早超过3天，说明今天大概率是节假日
+            try:
+                delta = (
+                    datetime.strptime(today, "%Y-%m-%d")
+                    - datetime.strptime(last_trading_date, "%Y-%m-%d")
+                ).days
+                if delta > 3:
+                    return False
+            except ValueError:
+                pass
+    return True
 
 
 def is_trading_time() -> bool:
@@ -2544,14 +2595,16 @@ def check_and_fill_missing_data():
             logger.info(f"✅ 费率补全完成：成功{done}/{len(missing_fee)}只")
 
         # 补全缺失规模（pingzhongdata季度AUM，仅处理scale=0的基金）
-        with _lock:
-            missing_scale = [
-                code for code, info in etf_spot.items()
-                if not info.get("scale") or info.get("scale") == 0
-            ]
-        if missing_scale:
-            logger.info(f"🔄 开始补全{len(missing_scale)}只规模缺失基金的规模（pingzhong）")
-            _supplement_scale_from_pingzhong(missing_scale)
+        # 只在非交易时段运行，避免与行情请求竞争（已用独立session，但仍占带宽）
+        if not is_trading_time():
+            with _lock:
+                missing_scale = [
+                    code for code, info in etf_spot.items()
+                    if not info.get("scale") or info.get("scale") == 0
+                ]
+            if missing_scale:
+                logger.info(f"🔄 开始补全{len(missing_scale)}只规模缺失基金的规模（pingzhong）")
+                _supplement_scale_from_pingzhong(missing_scale)
 
         # 保存最新数据
         save_spot_cache()
