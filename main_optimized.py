@@ -1061,6 +1061,78 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
     return "none", {}
 
 
+def _tencent_prefix(code: str) -> str:
+    """Return Tencent exchange prefix for a fund code."""
+    if code[0] == "5":
+        return "sh"
+    if code[:2] in ("15", "16"):
+        return "sz"
+    if code[0] == "0":
+        return "sz"
+    return "sh"
+
+
+def _supplement_with_tencent(spot: Dict[str, Dict], fund_names: Dict[str, str]) -> int:
+    """
+    For codes missing price in `spot`, query Tencent real-time quote API and fill them in.
+    Returns count of codes filled.
+    """
+    missing = [code for code, data in spot.items() if not data.get("currentPrice")]
+    if not missing:
+        return 0
+
+    filled = 0
+    batch_size = 80
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i : i + batch_size]
+        query = ",".join(_tencent_prefix(c) + c for c in batch)
+        try:
+            text = _request_text_sina(
+                f"https://qt.gtimg.cn/q={query}",
+                params={},
+                headers={"Referer": "https://stockapp.finance.qq.com"},
+            )
+            for line in text.strip().split("\n"):
+                if "~" not in line:
+                    continue
+                parts = line.split("~")
+                if len(parts) < 35:
+                    continue
+                code = parts[2]
+                if code not in spot:
+                    continue
+                try:
+                    price = float(parts[3]) if parts[3] else 0.0
+                    prev_close = float(parts[4]) if parts[4] else 0.0
+                    if price <= 0:
+                        continue
+                    open_ = float(parts[5]) if parts[5] else 0.0
+                    high = float(parts[33]) if parts[33] else price
+                    low = float(parts[34]) if parts[34] else price
+                    volume = int(float(parts[6])) if parts[6] else 0
+                    turnover = float(parts[37]) if len(parts) > 37 and parts[37] else 0.0
+                    chg_pct = round((price - prev_close) / prev_close * 100, 2) if prev_close > 0 else 0.0
+                    spot[code].update({
+                        "currentPrice": round(price, 4),
+                        "chgPct": chg_pct,
+                        "prevClose": round(prev_close, 4),
+                        "open": round(open_, 4),
+                        "high": round(high, 4),
+                        "low": round(low, 4),
+                        "volume": volume,
+                        "turnover": round(turnover, 2),
+                    })
+                    filled += 1
+                except (ValueError, IndexError):
+                    continue
+        except Exception as exc:
+            logger.warning("Tencent quote supplement failed (batch %d): %s", i // batch_size, exc)
+        time.sleep(0.3)
+
+    logger.info("Tencent supplement filled %d/%d missing-price ETFs", filled, len(missing))
+    return filled
+
+
 # 独立的溢价刷新任务，不依赖spot刷新
 def refresh_all_premium() -> None:
     """刷新所有ETF的溢价数据，独立定时任务"""
@@ -1983,10 +2055,18 @@ def refresh_spot(force: bool = False) -> None:
         provider, new_spot = fetch_spot_live(scale_hints)
         if not new_spot:
             logger.warning("Got empty spot data from live source, keeping existing data")
-            # 即使没有新数据，也要更新last_updated，避免前端显示过期太久
             with _lock:
                 last_updated = _now_bj_str()
             return
+
+        # Supplement missing-price ETFs from Tencent quote API
+        with _lock:
+            fund_names = {c: d.get("name", "") for c, d in etf_spot.items()}
+        for code, name in fund_names.items():
+            if code not in new_spot:
+                new_spot[code] = {"code": code, "name": name, "currentPrice": 0.0,
+                                  "chgPct": 0.0, "scale": 0.0, "volume": 0, "turnover": 0.0}
+        _supplement_with_tencent(new_spot, fund_names)
 
         index_provider, new_indices = fetch_indices_live()
 
