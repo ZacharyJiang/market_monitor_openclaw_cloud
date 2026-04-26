@@ -690,7 +690,7 @@ SINA_INDEX_URL = "https://hq.sinajs.cn/list=s_sh000001,s_sz399001,s_sh000300"
 TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 
 
-def _calc_scale(row: Dict) -> float:
+def _calc_scale(row: Dict, code: str = "") -> float:
     iopv = _safe_float(row.get("f441"))
     shares = _safe_float(row.get("f38"))
     if iopv > 0 and shares > 0:
@@ -707,6 +707,13 @@ def _calc_scale(row: Dict) -> float:
         return round(flow_mv / 1e8, 2)
     if flow_mv > 0:
         return round(flow_mv / 1e4, 2)
+
+    # LOF/QDII/REIT: f441=0 但有份额(f38)和NAV缓存时，用 份额×NAV 计算规模
+    if shares > 0 and code:
+        nav_entry = _nav_cache.get(code, {})
+        nav = nav_entry.get("nav", 0)
+        if nav > 0:
+            return round(nav * shares / 1e8, 2)
 
     turnover = _safe_float(row.get("f6"))
     if turnover > 0:
@@ -811,7 +818,7 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
         "name": name,
         "currentPrice": round(price, 4),
         "chgPct": round(_safe_float(row.get("f3")), 2),
-        "scale": _calc_scale(row),
+        "scale": _calc_scale(row, code),
         "volume": int(_safe_float(row.get("f5"))),
         "turnover": round(_safe_float(row.get("f6")) / 1e8, 2),
         "fee": fee_total,
@@ -2502,11 +2509,20 @@ def check_and_fill_missing_data():
                 except Exception as e:
                     failed += 1
                     logger.debug(f"补全费率失败 {code}: {e}")
-                # 限流控制
                 if (idx + 1) % 20 == 0:
                     time.sleep(1)
             logger.info(f"✅ 费率补全完成：成功{done}/{len(missing_fee)}只")
-        
+
+        # 补全缺失规模（pingzhongdata季度AUM，仅处理scale=0的基金）
+        with _lock:
+            missing_scale = [
+                code for code, info in etf_spot.items()
+                if not info.get("scale") or info.get("scale") == 0
+            ]
+        if missing_scale:
+            logger.info(f"🔄 开始补全{len(missing_scale)}只规模缺失基金的规模（pingzhong）")
+            _supplement_scale_from_pingzhong(missing_scale)
+
         # 保存最新数据
         save_spot_cache()
         logger.info("✅ 数据补全任务完成")
