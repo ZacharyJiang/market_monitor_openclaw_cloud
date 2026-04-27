@@ -715,33 +715,44 @@ TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 
 
 def _calc_scale(row: Dict, code: str = "") -> float:
+    """从 spot 列表 API 一行计算总规模（亿元）。0 表示无法解析。
+
+    优先 f20（列表 API 总市值，最稳定），其次 f441×f38，再次 NAV cache×shares。
+    f21（流通市值）和 f6（成交额）都不代表总规模——已移除。
+    f441 偶尔被 Eastmoney 以 10× 放大返回（部分 LOF），与 f20 交叉校验后取 f20。
+    """
+    total_mv = _safe_float(row.get("f20"))
     iopv = _safe_float(row.get("f441"))
     shares = _safe_float(row.get("f38"))
+
+    # 1) f20 总市值——最稳定，Eastmoney 一致按净值×份额计算
+    if total_mv > 1e7:
+        scale_f20 = round(total_mv / 1e8, 2)
+        # 与 f441×f38 交叉校验：相差 > 5× 时怀疑 f441 单位异常，信任 f20
+        if iopv > 0 and shares > 0:
+            scale_iopv = iopv * shares / 1e8
+            if scale_iopv > 0 and (
+                scale_iopv / scale_f20 > 5 or scale_f20 / scale_iopv > 5
+            ):
+                logger.warning(
+                    "Scale unit anomaly %s: iopv×shares=%.2f 亿 vs f20=%.2f 亿, prefer f20",
+                    code, scale_iopv, scale_f20,
+                )
+        return scale_f20
+
+    # 2) f441 × f38（NAV × 份额）
     if iopv > 0 and shares > 0:
         return round(iopv * shares / 1e8, 2)
 
-    total_mv = _safe_float(row.get("f20"))
-    if total_mv > 1e6:
-        return round(total_mv / 1e8, 2)
-    if total_mv > 0:
-        return round(total_mv / 1e4, 2)
-
-    flow_mv = _safe_float(row.get("f21"))
-    if flow_mv > 1e6:
-        return round(flow_mv / 1e8, 2)
-    if flow_mv > 0:
-        return round(flow_mv / 1e4, 2)
-
-    # LOF/QDII/REIT: f441=0 但有份额(f38)和NAV缓存时，用 份额×NAV 计算规模
+    # 3) NAV cache × shares（LOF/QDII：列表 API 当日 f441 缺失时）
     if shares > 0 and code:
-        nav_entry = _nav_cache.get(code, {})
-        nav = nav_entry.get("nav", 0)
+        nav = _nav_cache.get(code, {}).get("nav", 0)
         if nav > 0:
             return round(nav * shares / 1e8, 2)
 
-    turnover = _safe_float(row.get("f6"))
-    if turnover > 0:
-        return round(turnover / 1e8, 2)
+    # 4) f20 在「万元」单位（极少见兜底）
+    if total_mv > 0:
+        return round(total_mv / 1e4, 2)
 
     return 0.0
 
@@ -821,15 +832,7 @@ def _parse_spot_row(row: Dict, scale_hints: Optional[Dict[str, float]] = None) -
                 with _lock:
                     _premium_cache[code] = premium_value
 
-    # 优先级3：使用premium缓存
-    if premium_value is None:
-        with _lock:
-            cached_premium = _premium_cache.get(code)
-        if cached_premium is not None and cached_premium != 0 and abs(cached_premium) < 30:
-            premium_value = round(cached_premium, 2)
-            premium_source = "cache"
-
-    # 优先级4：用NAV缓存计算（LOF/QDII/REIT基金，f441=0但有每日公布净值）
+    # 优先级3：用 NAV 缓存 + 实时价格计算（每日公布净值，比陈旧 premium_cache 更准）
     # 价格优先级：f2(实时价) > etf_spot currentPrice(今日收盘) > f18(昨收)
     if premium_value is None:
         nav_entry = _nav_cache.get(code)
@@ -848,6 +851,14 @@ def _parse_spot_row(row: Dict, scale_hints: Optional[Dict[str, float]] = None) -
                     premium_source = "nav_cache"
                     with _lock:
                         _premium_cache[code] = premium_value
+
+    # 优先级4：陈旧 premium 缓存兜底
+    if premium_value is None:
+        with _lock:
+            cached_premium = _premium_cache.get(code)
+        if cached_premium is not None and cached_premium != 0 and abs(cached_premium) < 30:
+            premium_value = round(cached_premium, 2)
+            premium_source = "cache"
 
     # 净值(IOPV)：f441即为IOPV参考净值
     if f441_raw is not None and f441_raw > 0:
@@ -1328,7 +1339,7 @@ def _fetch_scale_via_ulist_batch(codes: List[str]) -> Dict[str, float]:
             if not code:
                 continue
 
-            scale = _scale_from_row_fields(row)
+            scale = _scale_from_row_fields(row, code)
             if scale > 0:
                 result[code] = scale
 
@@ -1343,34 +1354,52 @@ def _fetch_scale_via_ulist_batch(codes: List[str]) -> Dict[str, float]:
     return result
 
 
-def _scale_from_row_fields(row: Dict) -> float:
-    """从一行 secid 返回中按优先级取规模（亿元）。0 表示无法解析。"""
-    # 1) f117 总市值 (主力)
+def _scale_from_row_fields(row: Dict, code: str = "") -> float:
+    """从一行 secid 返回中按优先级取规模（亿元）。0 表示无法解析。
+
+    注意：f164 是「流通市值」，对货币 ETF / 大体量 LOF 远小于总规模
+    （机构持有部分不计入流通），不能作为总规模 fallback——已移除。
+    """
     f117 = _safe_float(row.get("f117"))
-    if f117 > 1e7:
-        return round(f117 / 1e8, 2)
-    if f117 > 0:
-        return round(f117 / 1e4, 2)
-
-    # 2) f164 流通市值
-    f164 = _safe_float(row.get("f164"))
-    if f164 > 1e7:
-        return round(f164 / 1e8, 2)
-    if f164 > 0:
-        return round(f164 / 1e4, 2)
-
-    # 3) f20 list-API 总市值（极端情况下 LOF 走这条）
     f20 = _safe_float(row.get("f20"))
-    if f20 > 1e7:
-        return round(f20 / 1e8, 2)
-    if f20 > 0:
-        return round(f20 / 1e4, 2)
-
-    # 4) f441 × f38 最后兜底
     iopv = _safe_float(row.get("f441"))
     shares = _safe_float(row.get("f38"))
+
+    # 1) f117 总市值（主流 ETF 的权威字段）
+    if f117 > 1e7:
+        return round(f117 / 1e8, 2)
+
+    # 2) f20 列表 API 总市值（LOF/QDII/REIT 多走这条；f117 常返回 "-"）
+    if f20 > 1e7:
+        return round(f20 / 1e8, 2)
+
+    # 3) f441 × f38 (IOPV × 份额)。Eastmoney 偶尔对 LOF 返回 10× 放大值，
+    #    若同时拿到 f20 则做 sanity check：相差 > 5× 时优先 f20。
     if iopv > 0 and shares > 0:
-        return round(iopv * shares / 1e8, 2)
+        scale_iopv = round(iopv * shares / 1e8, 2)
+        if f20 > 0:
+            scale_f20 = round(f20 / 1e8 if f20 > 1e6 else f20 / 1e4, 2)
+            if scale_f20 > 0 and (
+                scale_iopv / scale_f20 > 5 or scale_f20 / scale_iopv > 5
+            ):
+                logger.warning(
+                    "Scale unit anomaly %s: iopv×shares=%s 亿 vs f20=%s 亿, prefer f20",
+                    code or row.get("f12"), scale_iopv, scale_f20,
+                )
+                return scale_f20
+        return scale_iopv
+
+    # 4) NAV cache × shares（LOF/QDII：当日 f441 缺失时用每日公布净值）
+    if shares > 0 and code:
+        nav = _nav_cache.get(code, {}).get("nav", 0)
+        if nav > 0:
+            return round(nav * shares / 1e8, 2)
+
+    # 5) 兜底：f117/f20 在「万元」级别（极少见）
+    if f117 > 0:
+        return round(f117 / 1e4, 2)
+    if f20 > 0:
+        return round(f20 / 1e4, 2)
 
     return 0.0
 
@@ -1491,8 +1520,16 @@ def _tencent_symbol(code: str) -> str:
     return f"sz{code}"
 
 
-def _fetch_kline_from_eastmoney(code: str, days: int = 1200) -> List[Dict]:
-    start_date = (datetime.now(BEIJING_TZ) - timedelta(days=days)).strftime("%Y%m%d")
+# 历史 K 线起始锚点：早于最早 ETF 上市日（华夏上证 50ETF, 2004-12-30），
+# 用绝对日期而非相对天数，避免随时间漂移导致历史数据被截断。
+KLINE_HISTORY_START = "20050101"
+
+
+def _fetch_kline_from_eastmoney(code: str, days: Optional[int] = None) -> List[Dict]:
+    if days is None:
+        start_date = KLINE_HISTORY_START
+    else:
+        start_date = (datetime.now(BEIJING_TZ) - timedelta(days=days)).strftime("%Y%m%d")
     end_date = datetime.now(BEIJING_TZ).strftime("%Y%m%d")
 
     for secid in _secid_candidates(code):
@@ -1539,11 +1576,16 @@ def _fetch_kline_from_eastmoney(code: str, days: int = 1200) -> List[Dict]:
     return []
 
 
-def _fetch_kline_from_tencent(code: str, days: int = 1200) -> List[Dict]:
+def _fetch_kline_from_tencent(code: str, days: Optional[int] = None) -> List[Dict]:
     symbol = _tencent_symbol(code)
-    start_cutoff = (datetime.now(BEIJING_TZ) - timedelta(days=days)).date()
+    if days is None:
+        start_cutoff = datetime.strptime(KLINE_HISTORY_START, "%Y%m%d").date()
+    else:
+        start_cutoff = (datetime.now(BEIJING_TZ) - timedelta(days=days)).date()
 
     try:
+        # Tencent 单次最多返回约 1500 条，覆盖最近 ~6 年。作为 fallback 够用——
+        # Eastmoney 主路径已能直接给到全量历史。
         payload = _request_json_external(
             TENCENT_KLINE_URL,
             params={"param": f"{symbol},day,,,1500,qfq"},
@@ -1802,17 +1844,10 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                                 iopv_calc_success += 1
                                 continue
                     
-                    # 优先级3：使用premium缓存
-                    with _lock:
-                        cached_val = _premium_cache.get(code)
-                    if cached_val is not None and cached_val != 0 and abs(cached_val) < 30:
-                        results[code] = cached_val
-                        cache_hit += 1
-                        continue
-
-                    # 优先级4：用NAV缓存计算（LOF/QDII/REIT，f441=0）
-                    # 价格优先级：今日收盘价(etf_spot currentPrice) > f18(昨收)
+                    # 优先级3：用 NAV 缓存 + 实时价格计算（每日公布净值，比陈旧 cache 更准）
+                    # 价格优先级：今日收盘价(etf_spot currentPrice) > rdata prevClose > etf_spot prevClose
                     nav_entry = _nav_cache.get(code)
+                    nav_calc = None
                     if nav_entry:
                         nav_val = nav_entry.get("nav", 0)
                         with _lock:
@@ -1825,11 +1860,23 @@ def _fetch_premium_batch_sync(codes: List[str]) -> Dict[str, float]:
                         if nav_val > 0 and ref_price > 0:
                             calc = round(((ref_price - nav_val) / nav_val) * 100, 2)
                             if abs(calc) < 30:
-                                results[code] = calc
-                                with _lock:
-                                    _premium_cache[code] = calc
-                                    if code in etf_spot:
-                                        etf_spot[code]["premium"] = calc
+                                nav_calc = calc
+
+                    if nav_calc is not None:
+                        results[code] = nav_calc
+                        with _lock:
+                            _premium_cache[code] = nav_calc
+                            if code in etf_spot:
+                                etf_spot[code]["premium"] = nav_calc
+                        continue
+
+                    # 优先级4：陈旧 premium 缓存兜底
+                    with _lock:
+                        cached_val = _premium_cache.get(code)
+                    if cached_val is not None and cached_val != 0 and abs(cached_val) < 30:
+                        results[code] = cached_val
+                        cache_hit += 1
+                        continue
 
                 break  # 成功从某个endpoint获取数据，不再尝试其他
             
@@ -1895,7 +1942,7 @@ def _fetch_fee_from_eastmoney(code: str) -> bool:
     return False
 
 
-def fetch_kline_live(code: str, days: int = 1200) -> List[Dict]:
+def fetch_kline_live(code: str, days: Optional[int] = None) -> List[Dict]:
     # Fetch and update fees when fetching kline
     _fetch_fee_from_eastmoney(code)
     
