@@ -745,7 +745,7 @@ def _calc_scale(row: Dict, code: str = "") -> float:
     return 0.0
 
 
-def _parse_spot_row(row: Dict) -> Optional[Dict]:
+def _parse_spot_row(row: Dict, scale_hints: Optional[Dict[str, float]] = None) -> Optional[Dict]:
     code = str(row.get("f12", "")).zfill(6)
     name = str(row.get("f14", "")).strip()
     price = _safe_float(row.get("f2"))
@@ -861,12 +861,18 @@ def _parse_spot_row(row: Dict) -> Optional[Dict]:
         if cached_nav is not None and cached_nav != 0:
             nav_value = round(cached_nav, 4) if isinstance(cached_nav, float) else cached_nav
 
+    # 规模：优先使用 scale_hints（refresh_all_scales 用 ulist f117 写入的权威值），
+    # 仅当无 hint 时才回退到 _calc_scale (f441×f38)。否则每 2 分钟 spot 刷新
+    # 会把 refresh_all_scales 的更新值覆盖回 f441×f38 的滞后估算。
+    hinted_scale = _safe_float(scale_hints.get(code), 0.0) if scale_hints else 0.0
+    scale_value = round(hinted_scale, 2) if hinted_scale > 0 else _calc_scale(row, code)
+
     result = {
         "code": code,
         "name": name,
         "currentPrice": round(price, 4),
         "chgPct": round(_safe_float(row.get("f3")), 2),
-        "scale": _calc_scale(row, code),
+        "scale": scale_value,
         "volume": int(_safe_float(row.get("f5"))),
         "turnover": round(_safe_float(row.get("f6")) / 1e8, 2),
         "fee": fee_total,
@@ -922,7 +928,7 @@ def _parse_spot_row_sina(row: Dict, scale_hints: Dict[str, float]) -> Optional[D
     }
 
 
-def _fetch_spot_from_endpoint(url: str) -> Dict[str, Dict]:
+def _fetch_spot_from_endpoint(url: str, scale_hints: Optional[Dict[str, float]] = None) -> Dict[str, Dict]:
     base_params = {
         "pn": "1",
         "pz": "1000",
@@ -956,7 +962,7 @@ def _fetch_spot_from_endpoint(url: str) -> Dict[str, Dict]:
 
     result: Dict[str, Dict] = {}
     for row in rows:
-        parsed = _parse_spot_row(row)
+        parsed = _parse_spot_row(row, scale_hints=scale_hints)
         if not parsed:
             continue
         result[parsed["code"]] = parsed
@@ -1130,7 +1136,7 @@ def fetch_spot_live(scale_hints: Dict[str, float]) -> Tuple[str, Dict[str, Dict]
     # Primary: Eastmoney
     for endpoint in SPOT_ENDPOINTS:
         try:
-            spot = _fetch_spot_from_endpoint(endpoint)
+            spot = _fetch_spot_from_endpoint(endpoint, scale_hints=scale_hints)
             if spot:
                 logger.info("Spot fetched from %s, count=%s", endpoint, len(spot))
                 return "eastmoney", spot
