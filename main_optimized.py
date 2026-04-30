@@ -60,7 +60,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-REFRESH_MINUTES = _env_int("REFRESH_MINUTES", 2)
+REFRESH_MINUTES = _env_int("REFRESH_MINUTES", 5)
 KLINE_REFRESH_MINUTES = _env_int("KLINE_REFRESH_MINUTES", 180)
 KLINE_BATCH_SIZE = max(1, _env_int("KLINE_BATCH_SIZE", 2))
 # KLINE_TOP_N: 控制每批 K 线刷新处理的 ETF 数量
@@ -247,17 +247,38 @@ logger.info("✅ ETF monitor service started successfully, listening on port 808
 # HTTP SESSION
 # ============================================================
 
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+]
+
+_REFERER_POOL = [
+    "https://quote.eastmoney.com/",
+    "https://quote.eastmoney.com/center/gridlist.html",
+    "https://data.eastmoney.com/etf/default.html",
+    "https://fund.eastmoney.com/",
+    "https://www.eastmoney.com/",
+]
+
+
+def _rotate_headers():
+    SESSION.headers["User-Agent"] = random.choice(_UA_POOL)
+    SESSION.headers["Referer"] = random.choice(_REFERER_POOL)
+
+
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": random.choice(_UA_POOL),
         "Accept": "application/json,text/plain,*/*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": "https://quote.eastmoney.com/",
+        "Referer": random.choice(_REFERER_POOL),
         "Connection": "close",
     }
 )
@@ -353,9 +374,9 @@ class RequestController:
                 wait_time = 0
             self.last_request_at = now + wait_time
 
+        _rotate_headers()
         if wait_time > 0:
-            # 大抖动 0.5-2s：降低请求节奏的可识别性，减少 IP 风控触发
-            time.sleep(wait_time + random.uniform(0.5, 2.0))
+            time.sleep(wait_time + random.uniform(2.0, 5.0))
 
     def record_success(self) -> None:
         with self._lock:
@@ -1450,8 +1471,8 @@ def refresh_all_scales(force: bool = False) -> None:
     刷新所有 ETF/LOF/REIT 的最新规模，使用单条行情后端 f117（与 Eastmoney APP 一致）。
     覆盖 etf_spot[code]['scale']——比 _calc_scale 的 f441×f38 更新及时。
 
-    频控：复用全局 _request_json 限流器（API_BASE_INTERVAL=2.5s/次），
-          1500 只 / 50 一批 ≈ 30 次请求 ≈ 75s 完成。
+    频控：复用全局 _request_json 限流器（API_BASE_INTERVAL=5.0s/次），
+          1500 只 / 50 一批 ≈ 30 次请求 ≈ 150s 完成。
     交易日：非交易日跳过（份额变化小，无需刷新）；force=True 时绕过此校验
             （用于启动时无条件修正）。
     """
@@ -1532,26 +1553,27 @@ def refresh_all_premium() -> None:
 
 
 def fetch_indices_live() -> Tuple[str, List[Dict]]:
-    try:
-        indices = _fetch_indices_from_eastmoney()
-        if indices:
-            return "eastmoney", indices
-    except Exception as exc:
-        logger.warning("Index fetch (Eastmoney) failed: %s", exc)
-
+    # Sina/Tencent 优先：单请求取 3 指数，不消耗 push2 配额
     try:
         indices = _fetch_indices_from_sina()
-        if indices:
+        if len(indices) >= 2:
             return "sina", indices
     except Exception as exc:
         logger.warning("Index fetch (Sina) failed: %s", exc)
 
     try:
         indices = _fetch_indices_from_tencent()
-        if indices:
+        if len(indices) >= 2:
             return "tencent", indices
     except Exception as exc:
         logger.warning("Index fetch (Tencent) failed: %s", exc)
+
+    try:
+        indices = _fetch_indices_from_eastmoney()
+        if indices:
+            return "eastmoney", indices
+    except Exception as exc:
+        logger.warning("Index fetch (Eastmoney) failed: %s", exc)
 
     return "none", []
 
@@ -1573,8 +1595,10 @@ def _tencent_symbol(code: str) -> str:
 KLINE_HISTORY_START = "20050101"
 
 
-def _fetch_kline_from_eastmoney(code: str, days: Optional[int] = None) -> List[Dict]:
-    if days is None:
+def _fetch_kline_from_eastmoney(code: str, days: Optional[int] = None, start_override: Optional[str] = None) -> List[Dict]:
+    if start_override:
+        start_date = start_override
+    elif days is None:
         start_date = KLINE_HISTORY_START
     else:
         start_date = (datetime.now(BEIJING_TZ) - timedelta(days=days)).strftime("%Y%m%d")
@@ -1624,9 +1648,11 @@ def _fetch_kline_from_eastmoney(code: str, days: Optional[int] = None) -> List[D
     return []
 
 
-def _fetch_kline_from_tencent(code: str, days: Optional[int] = None) -> List[Dict]:
+def _fetch_kline_from_tencent(code: str, days: Optional[int] = None, start_override: Optional[str] = None) -> List[Dict]:
     symbol = _tencent_symbol(code)
-    if days is None:
+    if start_override:
+        start_cutoff = datetime.strptime(start_override, "%Y%m%d").date()
+    elif days is None:
         start_cutoff = datetime.strptime(KLINE_HISTORY_START, "%Y%m%d").date()
     else:
         start_cutoff = (datetime.now(BEIJING_TZ) - timedelta(days=days)).date()
@@ -1991,9 +2017,26 @@ def _fetch_fee_from_eastmoney(code: str) -> bool:
 
 
 def fetch_kline_live(code: str, days: Optional[int] = None) -> List[Dict]:
-    # Fetch and update fees when fetching kline
     _fetch_fee_from_eastmoney(code)
-    
+
+    existing = load_kline(code)
+
+    # 增量拉取：有缓存且非指定天数模式时，只拉缓存末日之后的数据
+    if existing and days is None:
+        last_date = existing[-1].get("date", "")
+        if last_date:
+            incremental_start = last_date.replace("-", "")
+            new_data = _fetch_kline_from_eastmoney(code, start_override=incremental_start)
+            if not new_data:
+                new_data = _fetch_kline_from_tencent(code, start_override=incremental_start)
+            if new_data:
+                date_set = {k["date"] for k in existing}
+                merged = existing + [k for k in new_data if k["date"] not in date_set]
+                merged.sort(key=lambda x: x["date"])
+                return merged
+            return existing
+
+    # 无缓存或指定 days：全量拉取
     eastmoney_kline = _fetch_kline_from_eastmoney(code, days)
     if eastmoney_kline:
         return eastmoney_kline
@@ -2003,7 +2046,7 @@ def fetch_kline_live(code: str, days: Optional[int] = None) -> List[Dict]:
         logger.debug("Kline fallback hit (provider=tencent, code=%s)", code)
         return tencent_kline
 
-    return []
+    return existing or []
 
 
 # ============================================================
@@ -2554,6 +2597,13 @@ def refresh_spot(force: bool = False) -> None:
             else:
                 live_provider = "live"
 
+            # premium 兜底：spot 解析后仍无溢价的 ETF，用缓存填充
+            for code, info in etf_spot.items():
+                if info.get("premium") in (None, 0):
+                    cached = _premium_cache.get(code)
+                    if cached is not None and cached != 0 and abs(cached) < 30:
+                        info["premium"] = round(cached, 2)
+
         save_spot_cache()
         logger.info("Spot refreshed: %s ETFs via %s", len(new_spot), live_provider)
     except Exception as exc:
@@ -2971,15 +3021,7 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
-    # 添加独立溢价刷新任务，每5分钟运行一次
-    scheduler.add_job(
-        refresh_all_premium,
-        "interval",
-        minutes=5,
-        id="premium_refresh",
-        max_instances=1,
-        coalesce=True,
-    )
+    # premium_refresh 已合并进 refresh_spot（spot 的 _parse_spot_row 已含完整 4 级溢价计算）
     # 添加每日基金发现定时任务，每天凌晨2点执行，发现新增ETF/LOF，补全缺失基金
     scheduler.add_job(
         _ensure_all_etfs_in_spot,

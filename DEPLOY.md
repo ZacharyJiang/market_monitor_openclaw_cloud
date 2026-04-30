@@ -20,7 +20,7 @@ pip install -r requirements.txt
 cp .env.example .env
 # 按需调整 .env
 set -a && source .env && set +a
-uvicorn main:app --host 127.0.0.1 --port 8080
+uvicorn main_optimized:app --host 127.0.0.1 --port 8080
 ```
 
 建议使用 `systemd` 托管进程，避免会话断开后服务退出。
@@ -134,13 +134,18 @@ nginx -t && systemctl reload nginx
 
 - 当前后端只使用真实行情接口，不再自动生成 Demo/Mock 数据。
 - 数据源策略：
-  - ETF实时行情：`Eastmoney -> Sina` 回退
-  - 指数：`Eastmoney -> Sina` 回退
-  - K线：`Eastmoney -> Tencent` 回退
+  - ETF 实时行情 (spot)：`push2 clist (88/48.push2.eastmoney.com)`
+  - ETF 规模 (scale)：`push2 ulist f117/f20`
+  - 溢价 (premium)：`push2 ulist f402/f441` → NAV+price 计算
+  - 指数：`push2` → `新浪 hq.sinajs.cn` → `腾讯 qt.gtimg.cn`
+  - K 线：`push2his.eastmoney.com` → `腾讯 web.ifzq.gtimg.cn`（备用约 641 行）
+  - NAV：`api.fund.eastmoney.com/f10/lsjz`（每日 BJT 20:00 采集）
+  - 费率：`fundf10.eastmoney.com/jjfl_{code}.html`（每日 03:00 采集）
 - `source` 字段说明：
   - `live`: 实时拉取成功
   - `cache`: 实时拉取失败，使用上次缓存
   - `degraded`: 实时和缓存均不可用
+- **push2 风控**：东方财富 push2 系列接口存在段级 IP 封禁风险（非单 IP）。封禁期间 spot/scale/premium/kline 降级为缓存，价格通过新浪/腾讯继续更新，但规模和 K 线全量历史受影响。
 
 ## 6. 常用检查
 
@@ -149,8 +154,9 @@ curl -s http://127.0.0.1:8080/api/health
 curl -s http://127.0.0.1:8080/api/etf-data | head
 ```
 
-关键限频参数（建议按默认值起步）：
+关键限频参数（当前默认值，可 .env 覆盖）：
 
-- `API_BASE_INTERVAL`: Eastmoney 基础请求间隔
-- `API_MAX_INTERVAL`: Eastmoney 失败后最大退避间隔
-- `SECONDARY_API_INTERVAL`: 新浪/腾讯备用源请求最小间隔
+- `API_BASE_INTERVAL=5.0`: push2 基础请求间隔(s)
+- `API_MAX_INTERVAL=30.0`: push2 失败后最大退避(s)
+- `SECONDARY_API_INTERVAL=1.0`: 新浪/腾讯备用源请求间隔(s)
+- `CIRCUIT_BREAKER_MAX_COOLDOWN=1800`: 渐进冷却上限(s)，风控持续时最长 30 分钟
