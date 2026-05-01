@@ -38,14 +38,14 @@ uvicorn main_optimized:app --host 0.0.0.0 --port 8080
 | 数据类型 | 主源 | 备用 |
 |----------|------|------|
 | ETF 实时行情 (spot) | push2 clist (88/48.push2.eastmoney.com) | — |
-| ETF 规模 (scale) | push2 ulist f117 → f20 | *(C-plan: fundf10 HTML，未实施)* |
+| ETF 规模 (scale) | push2 ulist f117 → f20 | QDII ETF 用 gmbd API NETNAV 覆盖（含场外联接基金） |
 | 溢价 (premium) | spot clist f402 / f441（已合并进 spot 刷新） | NAV+price 计算 → premium_cache |
 | 指数 | 新浪 hq.sinajs（主） | → 腾讯 qt.gtimg → push2 INDEX_ENDPOINT（兜底） |
 | K 线 | push2his.eastmoney.com（增量拉取） | → 腾讯 web.ifzq.gtimg（约 641 行） |
 | NAV (净值) | api.fund.eastmoney.com/f10/lsjz | 内存缓存 |
 | 费率 | fundf10.eastmoney.com/jjfl_{code}.html | fee_cache.json |
 
-**LOF 规模注意**: fundf10 返回「基金合并资产规模」（含场外联接基金），≠ 场内流通份额。场内规模只能从 push2 ulist f20 取。
+**LOF 规模注意**: fundf10 返回「基金合并资产规模」（含场外联接基金），≠ 场内流通份额。场内规模只能从 push2 ulist f20 取。**例外**: QDII ETF 的场内份额远小于总规模（大部分通过联接基金持有），用户期望看到含场外的净资产规模，因此 QDII 使用 gmbd API 的 NETNAV 覆盖 ulist 值。
 
 **K 线历史注意**: push2his 支持全量历史（KLINE_HISTORY_START = "20050101"）；腾讯备用约 641 行；Sina 备用 max 1000 行。早期 ETF（如 510050，2005 年成立）完整历史依赖 push2his。
 
@@ -91,4 +91,4 @@ curl -s http://127.0.0.1:8080/api/diag | python3 -m json.tool | head -60
 
 1. **push2 段级封禁**: 见「数据源策略」中的防风控措施说明。2026-04-29 触发封禁后已做降量改造
 2. **Cloudflare A 记录**: 腾讯云换 IP 后须在 Cloudflare Dashboard 手动更新，否则 522 错误
-3. **规模无备用源**: fundf10 返回合并资产规模（含场外），不可替代 push2 ulist 的场内规模
+3. **QDII 规模修正**: ulist f117/f38 对 QDII ETF 只返回场内份额/市值，通过 gmbd API (FundArchivesDatas) 获取含场外的净资产规模并覆盖

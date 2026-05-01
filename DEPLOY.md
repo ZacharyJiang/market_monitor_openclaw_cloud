@@ -136,8 +136,8 @@ nginx -t && systemctl reload nginx
 - 数据源策略：
   - ETF 实时行情 (spot)：`push2 clist (88/48.push2.eastmoney.com)`
   - ETF 规模 (scale)：`push2 ulist f117/f20`
-  - 溢价 (premium)：`push2 ulist f402/f441` → NAV+price 计算
-  - 指数：`push2` → `新浪 hq.sinajs.cn` → `腾讯 qt.gtimg.cn`
+  - 溢价 (premium)：`spot clist f402/f441`（已合并进 spot 刷新） → NAV+price 计算
+  - 指数：`新浪 hq.sinajs.cn`（主） → `腾讯 qt.gtimg.cn` → `push2`（兜底）
   - K 线：`push2his.eastmoney.com` → `腾讯 web.ifzq.gtimg.cn`（备用约 641 行）
   - NAV：`api.fund.eastmoney.com/f10/lsjz`（每日 BJT 20:00 采集）
   - 费率：`fundf10.eastmoney.com/jjfl_{code}.html`（每日 03:00 采集）

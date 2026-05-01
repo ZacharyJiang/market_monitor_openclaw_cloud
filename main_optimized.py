@@ -315,6 +315,20 @@ _pingzhong_rate_lock = threading.Lock()
 _pingzhong_last_call_at: float = 0.0
 _PINGZHONG_INTERVAL = 1.0  # pingzhong 请求间隔（秒）
 
+# 独立的 gmbd (FundArchivesDatas) 采集 session，用于 QDII ETF 总规模
+# fundf10.eastmoney.com 与 fee 页面同主机，使用独立限流
+_GMBD_SESSION = requests.Session()
+_GMBD_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+    "Referer": "https://fundf10.eastmoney.com/",
+})
+_gmbd_rate_lock = threading.Lock()
+_gmbd_last_call_at: float = 0.0
+_GMBD_INTERVAL = 0.8  # gmbd 请求间隔（秒），与 _FEE_INTERVAL 一致
+
+# QDII 规模缓存: {code: {"scale": float, "ftype": str, "is_qdii": bool, "date": str}}
+_qdii_scale_cache: Dict[str, Dict] = {}
+
 # 溢价刷新时间戳（非交易时段限频用）
 _premium_last_full_refresh: float = 0.0
 
@@ -1305,6 +1319,179 @@ def _supplement_with_tencent(spot: Dict[str, Dict], fund_names: Dict[str, str]) 
     return filled
 
 
+# QDII 候选名称关键词（海外市场追踪）
+_QDII_NAME_KEYWORDS = (
+    "纳指", "标普", "纳斯达克", "道琼", "德国", "DAX", "法国", "英国",
+    "欧洲", "日经", "日本", "印度", "越南", "东南亚", "原油", "油气",
+    "QDII", "海外", "中概", "全球", "白银", "豆粕", "有色金属",
+)
+
+
+def _is_qdii_candidate(code: str, name: str) -> bool:
+    """Quick name-based pre-screen for QDII/overseas ETF candidates.
+
+    Intentionally broad — gmbd API 的 FTYPE 字段会做权威确认或排除。
+    已确认 is_qdii=False 的（如黄金 ETF）后续直接跳过。
+    """
+    if not name:
+        return False
+    with _lock:
+        if code in etf_spot:
+            flag = etf_spot[code].get("is_qdii")
+            if flag is True:
+                return True
+            if flag is False:
+                return False
+    return any(kw in name for kw in _QDII_NAME_KEYWORDS)
+
+
+def _fetch_qdii_scale_from_gmbd(code: str) -> Optional[Dict]:
+    """从 FundArchivesDatas gmbd API 获取 QDII ETF 净资产规模（含场外联接基金）。
+
+    返回 {"scale": float(亿元), "ftype": str, "is_qdii": bool, "date": str}，
+    失败返回 None。使用独立 _GMBD_SESSION 限流。
+    """
+    global _gmbd_last_call_at
+
+    cached = _qdii_scale_cache.get(code)
+    if cached and cached.get("date") == _today_bj_str():
+        return cached
+
+    try:
+        with _gmbd_rate_lock:
+            elapsed = time.time() - _gmbd_last_call_at
+            wait = _GMBD_INTERVAL - elapsed
+            if wait > 0:
+                time.sleep(wait)
+            _gmbd_last_call_at = time.time()
+
+        url = "https://fundf10.eastmoney.com/FundArchivesDatas.aspx"
+        params = {"type": "gmbd", "code": code}
+        resp = _GMBD_SESSION.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        text = resp.text
+        if not text:
+            return None
+
+        import re as _re
+
+        # gmbd API 返回 JS 赋值：var gmbd_apidata={content:"...",summary:"...",data:[{...}]}
+        # 取 data 数组第一条（最新季度）的 NETNAV 和 FTYPE
+        netnav = 0.0
+        ftype = ""
+        is_qdii = False
+
+        # 提取 data 数组第一个对象的 NETNAV 和 FTYPE
+        data_m = _re.search(r'"data"\s*:\s*\[', text)
+        if data_m:
+            snippet = text[data_m.end():]
+            # NETNAV — 净资产（元）
+            netnav_m = _re.search(r'"NETNAV"\s*:\s*([\d.]+)', snippet)
+            if netnav_m:
+                netnav = _safe_float(netnav_m.group(1))
+            # FTYPE — 基金类型
+            ftype_m = _re.search(r'"FTYPE"\s*:\s*"([^"]+)"', snippet)
+            if ftype_m:
+                ftype = ftype_m.group(1).strip()
+
+        is_qdii = "QDII" in ftype or "海外" in ftype
+
+        scale_yi = round(netnav / 1e8, 2) if netnav > 1e6 else 0.0
+
+        result = {
+            "scale": scale_yi,
+            "ftype": ftype,
+            "is_qdii": is_qdii,
+            "date": _today_bj_str(),
+        }
+        _qdii_scale_cache[code] = result
+        return result
+
+    except Exception as exc:
+        logger.debug("gmbd scale fetch failed for %s: %s", code, exc)
+        return None
+
+
+def _refresh_qdii_scales(force: bool = False) -> None:
+    """QDII ETF 规模修正：用 gmbd API 的 NETNAV 覆盖 ulist 场内规模。
+
+    ulist f117/f38 对 QDII ETF 只返回场内份额/市值，而大部分份额通过场外联接基金持有。
+    gmbd API 返回的 NETNAV 是包含场外的净资产规模，与 fundf10 页面一致。
+
+    在 refresh_all_scales() 之后调用，同时设置 is_qdii 标志供后续识别。
+    force=True 时无条件刷新（启动时）；否则当天已刷新过的 QDII 跳过。
+    """
+    if not etf_spot:
+        return
+
+    # 非 force 模式：检查今天是否已刷新过（gmbd 数据季度更新，无需高频采集）
+    today = _today_bj_str()
+    if not force:
+        # 如果所有已知 QDII 今天都已缓存，直接跳过
+        with _lock:
+            known_qdii = [c for c, info in etf_spot.items() if info.get("is_qdii") is True]
+        if known_qdii and all(
+            _qdii_scale_cache.get(c, {}).get("date") == today for c in known_qdii
+        ):
+            logger.debug("QDII scales already refreshed today, skipping")
+            return
+
+    candidates = []
+    with _lock:
+        for code, info in etf_spot.items():
+            flag = info.get("is_qdii")
+            if flag is True:
+                candidates.append(code)
+            elif flag is False:
+                continue
+            elif _is_qdii_candidate(code, info.get("name", "")):
+                candidates.append(code)
+
+    if not candidates:
+        logger.debug("No QDII candidates found, skip gmbd scale refresh")
+        return
+
+    logger.info("Starting QDII scale refresh for %d candidates via gmbd API...", len(candidates))
+
+    overridden = 0
+    confirmed = 0
+    rejected = 0
+
+    for code in candidates:
+        result = _fetch_qdii_scale_from_gmbd(code)
+        if result is None:
+            continue
+
+        is_qdii = result.get("is_qdii", False)
+        gmbd_scale = result.get("scale", 0.0)
+
+        with _lock:
+            if code not in etf_spot:
+                continue
+            etf_spot[code]["is_qdii"] = is_qdii
+
+            if is_qdii and gmbd_scale > 0:
+                old_scale = _safe_float(etf_spot[code].get("scale"))
+                etf_spot[code]["scale"] = gmbd_scale
+                overridden += 1
+                confirmed += 1
+                if abs(gmbd_scale - old_scale) > 1.0:
+                    logger.info(
+                        "QDII scale override %s: ulist=%.2f亿 -> gmbd=%.2f亿 (FTYPE=%s)",
+                        code, old_scale, gmbd_scale, result.get("ftype", ""),
+                    )
+            elif not is_qdii:
+                rejected += 1
+
+    if overridden > 0:
+        save_spot_cache()
+
+    logger.info(
+        "QDII scale refresh done: candidates=%d overridden=%d confirmed=%d rejected=%d",
+        len(candidates), overridden, confirmed, rejected,
+    )
+
+
 def _supplement_scale_from_pingzhong(codes: List[str]) -> int:
     """
     For ETFs with scale=0, fetch quarterly scale data from pingzhongdata JS
@@ -1512,6 +1699,14 @@ def refresh_all_scales(force: bool = False) -> None:
         "Scale refresh done: updated=%d unchanged=%d fetched=%d total=%d",
         updated, unchanged, len(scales), len(all_codes),
     )
+
+    # QDII ETF：用 gmbd API 的 NETNAV 覆盖 ulist 场内规模
+    # （大部分份额通过场外联接基金持有，ulist 仅返回场内值）
+    # gmbd 数据为季度更新，非 force 时当天已刷新过就跳过
+    try:
+        _refresh_qdii_scales(force=force)
+    except Exception as exc:
+        logger.error("QDII scale refresh failed: %s", exc)
 
 
 # 独立的溢价刷新任务，不依赖spot刷新
