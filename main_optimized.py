@@ -1807,7 +1807,7 @@ def _fetch_kline_from_eastmoney(code: str, days: Optional[int] = None, start_ove
                     "secid": secid,
                     "ut": "7eea3edcaed734bea9cbfc24409ed989",
                     "klt": "101",
-                    "fqt": "1",
+                    "fqt": "0",
                     "beg": start_date,
                     "end": end_date,
                     "fields1": "f1,f2,f3,f4,f5,f6",
@@ -1857,7 +1857,7 @@ def _fetch_kline_from_tencent(code: str, days: Optional[int] = None, start_overr
         # Eastmoney 主路径已能直接给到全量历史。
         payload = _request_json_external(
             TENCENT_KLINE_URL,
-            params={"param": f"{symbol},day,,,1500,qfq"},
+            params={"param": f"{symbol},day,,,1500,"},
             retries=2,
             headers={
                 "User-Agent": SESSION.headers.get("User-Agent", "Mozilla/5.0"),
@@ -1878,7 +1878,7 @@ def _fetch_kline_from_tencent(code: str, days: Optional[int] = None, start_overr
     if not isinstance(node, dict):
         return []
 
-    raw_rows = node.get("qfqday") or node.get("day") or []
+    raw_rows = node.get("day") or []
     if not isinstance(raw_rows, list):
         return []
 
