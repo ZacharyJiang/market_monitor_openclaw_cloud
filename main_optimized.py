@@ -3227,11 +3227,11 @@ async def lifespan(app: FastAPI):
         max_instances=1,
         coalesce=True,
     )
-    # 添加数据完整性校验定时任务，每小时运行一次，统计缺失数据并补全
+    # 添加数据完整性校验定时任务，每24小时运行一次，统计缺失数据并补全
     scheduler.add_job(
         check_and_fill_missing_data,
         "interval",
-        minutes=60,
+        hours=24,
         id="data_fill",
         max_instances=1,
         coalesce=True,

@@ -71,7 +71,7 @@ FEISHU_WEBHOOK=               # 飞书通知（可选）
 | 任务 | 时间 |
 |------|------|
 | refresh_spot | 每 5 分钟（含溢价计算，已合并原 premium_refresh） |
-| data_fill | 每 60 分钟 |
+| data_fill | 每 24 小时 |
 | kline_refresh | 每 180 分钟 |
 | scale_refresh | 09:35 & 15:05 |
 | nav_refresh | 20:00 (UTC 12:00) |
